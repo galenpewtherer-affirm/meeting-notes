@@ -1,0 +1,6 @@
+# Google API credentials — never commit these
+scripts/credentials.json
+scripts/gmail_token.json
+
+# User-specific state
+scripts/processed_ids.json
