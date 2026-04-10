@@ -43,10 +43,39 @@ page first and use the parent page URL from the `<ancestor-path>` instead.
 
 ---
 
+### Step 2b — Search Notion for related documents (non-1:1 meetings only)
+
+Skip this step if the meeting title contains "1:1" (case-insensitive).
+
+Use `mcp__notion__notion-search` with `content_search_mode: workspace_search` to find
+related Notion pages:
+
+```json
+{
+  "query": "<meeting_title>",
+  "query_type": "internal",
+  "content_search_mode": "workspace_search",
+  "page_size": 6,
+  "max_highlight_length": 150
+}
+```
+
+From the results:
+- Keep only results with `type: "page"` (discard `google-calendar` and other types)
+- Exclude the meeting's own Notion page (match by page ID)
+- Take the top 2 remaining results
+
+Fetch the content of each kept page using `mcp__notion__notion-fetch`.
+
+These pages will be used as additional synthesis input in Step 3. If no relevant pages
+are found, proceed to Step 3 without them.
+
+---
+
 ### Step 3 — Synthesize a combined summary
 
-Using both the Zoom AI summary and the Notion AI meeting note content as inputs,
-write a single unified meeting summary following this structure:
+Using the Zoom AI summary, the Notion AI meeting note, and any related Notion pages
+fetched in Step 2b as inputs, write a single unified meeting summary following this structure:
 
 ```
 ## Quick Recap
@@ -68,6 +97,8 @@ that were considered and rejected]
 
 Synthesis guidelines:
 - Zoom AI summary and Notion AI notes may overlap — merge, don't duplicate
+- Related Notion pages (from Step 2b) provide background context — use them to enrich
+  Key Discussion Points and Additional Context, not to repeat what's already in the meeting note
 - Prefer specificity: keep concrete details (names, numbers, tool names, decisions)
 - If sources contradict, note both versions
 - Action items: consolidate from both sources, remove duplicates
