@@ -237,7 +237,7 @@ first match wins):
 
 | Base name pattern (case-insensitive)                          | Index subpage                              | Page ID                              |
 |---------------------------------------------------------------|--------------------------------------------|--------------------------------------|
-| starts with `Peak Event planning`                             | Peak Event planning                        | `198f70b4e4ed4434a3bacdd712027a1d`   |
+| starts with `Peak Event planning`                             | Peak Event planning                        | `34940e54ae388176b524c4ebb95dba24`   |
 | starts with `TPM weekly`                                      | TPM weekly                                 | `d231650717c54dd2aef8723e216b40a1`   |
 | starts with `Reliability Engineering Leadership`              | Reliability Engineering Leadership Weekly  | `95eb9d6808824fb98d13c753cd3acc05`   |
 | starts with `Availability Program weekly`                     | Availability Program weekly                | `1d03268088814b329961ef5377a9f142`   |
