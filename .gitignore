@@ -1,6 +1,9 @@
-# Google API credentials — never commit these
+# Google API credentials & OAuth tokens - never commit (regenerable locally)
 scripts/credentials.json
-scripts/gmail_token.json
+scripts/*token*.json
 
 # User-specific state
 scripts/processed_ids.json
+
+# Python caches
+scripts/__pycache__/
