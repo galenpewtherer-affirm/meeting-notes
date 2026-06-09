@@ -26,7 +26,9 @@ python3 /Users/galen.pewtherer/Claude/meeting-notes/scripts/fetch_zoom_emails.py
 ```
 
 This returns a JSON array. Each item has:
-- `gmail_id` — Gmail message ID (already marked processed)
+- `gmail_id` — Gmail message ID. **NOT yet marked processed** — you commit it in
+  Step 6 only after the note is written + filed. Track each meeting's `gmail_id`
+  so you can mark exactly the ones that succeed.
 - `meeting_title` — extracted from email subject
 - `date` — YYYY-MM-DD
 - `zoom_summary` — full Zoom AI summary text
@@ -40,8 +42,11 @@ To look further back: add `--since YYYY-MM-DD`
 
 ### Step 2 — For each meeting, find the Notion meeting note page
 
-Notion AI auto-creates a page per calendar meeting with title format
-`<Meeting Title> @<Date> <Time>` (e.g., "Peak Event planning @April 21, 2026 9:00 AM (PDT)").
+Notion AI auto-creates a page per calendar meeting. The title is
+`<Meeting Title> @<Date> <Time>`, but **the `<Date>` is often a RELATIVE phrase**,
+not an absolute date — e.g. "@Today", "@Yesterday", "@Last Tuesday 10:30 AM (PDT)",
+"@Last Friday 9:00 AM (PDT)". Recent pages almost always use the relative form, so
+**do not rely on the title containing an absolute date** (that was a prior bug).
 
 Use `mcp__notion__notion-search` to locate it:
 
@@ -63,21 +68,39 @@ Use `mcp__notion__notion-search` to locate it:
 
 Filter results:
 1. Keep only results where `type == "page"` (drop `google-calendar`, `gmail`, etc.)
-2. Match the result whose title contains the meeting's date (e.g., "@April 21, 2026"
-   matches `meeting_date = 2026-04-21`)
-3. If multiple pages match (rare), pick the one with the most recent `timestamp`
+2. Identify the candidate(s) whose base title (title with the `@...` suffix stripped)
+   matches the meeting title. The search is date-windowed already, so usually only the
+   right occurrence is in range.
+3. **Confirm the date by the page's `mention-date`, NOT the title.** Fetch each candidate
+   (next paragraph) and read the `<mention-date start="YYYY-MM-DD"/>` in its properties /
+   `<meeting-notes>` body. The match is the page whose `mention-date start` equals the
+   meeting date. This is the reliable check because titles use relative dates ("@Today").
+4. If two or more pages share the same base title AND `mention-date` (true duplicates),
+   pick the one with the most recent `timestamp` to write to, and **flag the duplicate(s)
+   in your final report** so they can be deduped — do not silently ignore them.
 
-The matched result's `id` is the **real, writable page ID** — use it for Step 4.
+The matched page's `id` is the **real, writable page ID** — use it for Step 4.
 
-Then fetch the page content with `mcp__notion__notion-fetch` using that `id` so you have
-the existing body (Notion AI's auto-summary) as one of the synthesis inputs in Step 3.
+Fetch the page content with `mcp__notion__notion-fetch` using that `id` (you need it both
+to confirm the `mention-date` above and to have the existing Notion AI auto-summary as a
+synthesis input in Step 3).
 
-**Detect the empty-Notion-AI case.** Inspect the fetched content. The page is considered
-empty if the body matches any of these patterns:
-- Contains `<empty-block/>` inside a `<notes>` block
-- Contains only a `<meeting-notes>` wrapper with no real content (just attendees +
-  `<mention-date>` + empty notes)
-- Has no `## Quick Recap` / `## Summary` / `## Key Discussion Points` style headings
+**Detect the empty-Notion-AI case — judge the `<summary>`, never the `<notes>`.**
+A populated Notion AI page has a rich `<summary>` block (headings, bullets, Action Items)
+while its `<notes>` block is **almost always empty** (`<empty-block/>` or a bare
+Agenda/Notes scaffold). That is the NORMAL, populated state — do **not** treat an empty
+`<notes>` block as an empty page (doing so was a bug that overwrote good Notion AI
+synthesis with Zoom-only content).
+
+The page is empty ONLY if its `<summary>` has no real content, i.e. any of:
+- The `<summary>` block is missing, or is itself `<empty-block/>` / whitespace.
+- The body contains Notion's no-content boilerplate, e.g. "It looks like your transcript
+  and notes are empty this time around" or "could not be generated due to insufficient
+  transcript".
+- There are no `### `/`## ` content headings and no Action Items anywhere in `<summary>`.
+
+(An empty `<notes>` block alongside a full `<summary>` is POPULATED — keep the Notion AI
+content as a synthesis input.)
 
 When empty, the Zoom AI summary becomes the **sole synthesis input** for Step 3 — proceed
 to Step 3 with Zoom-only content and add a leading callout to the output:
@@ -95,10 +118,32 @@ That tool returns block-reference URLs which look like page IDs but are not writ
 `notion-search` with the `@<Date>` title pattern is the only reliable way to get a real
 page ID for the update in Step 4.
 
-If no page is found via search, skip the meeting and report to the user. Do **not** call
-`notion-create-pages` — the page should already exist (Notion AI creates it when the
-calendar event runs). Creating a new page produces duplicates and orphans the underlying
-Zoom transcript link.
+**When search finds NO matching page.** Notion AI only auto-creates a page for calendar
+meetings it transcribes; ad-hoc Zooms, PMI/"Zoom Meeting"-titled calls, and meetings the
+notetaker missed produce a Zoom recap email but **no Notion page**. Decide as follows:
+
+- **First, make sure the title isn't the problem.** If `meeting_title` is generic
+  ("Zoom Meeting", "My Meeting", a bare PMI), the Notion title (if any) is named after the
+  participants, not "Zoom Meeting". Re-search using participant names pulled from the Zoom
+  recap's first "Quick recap" sentence (e.g. "Galen and Sarah discussed…" → search
+  "Sarah Galen", "Galen / Sarah"). Widen the date window to ±2 days (recap emails can lag
+  the meeting by a day).
+- **If a page genuinely does not exist after that**, and the Zoom summary HAS usable
+  content: **create the page** with `mcp__notion__notion-create-pages`, parented directly
+  under the correct index subpage from the Step 5 classify table (so it has a durable home
+  immediately). Title it `<Base Name> — YYYY-MM-DD`. Synthesize the body per Step 3 with
+  the Zoom-only callout. Then do the Step 5 "Insert the link" sub-step (the page is already
+  parented, so skip the re-parent). This is the supported path for meetings Notion AI never
+  captured.
+- **If the Zoom summary itself has no content** (e.g. "could not be generated due to
+  insufficient transcript") AND no Notion page exists, there is nothing to file: **skip**
+  and report (`RESULT: SKIPPED <reason>`). Do not create an empty page.
+
+**Creating is allowed ONLY here — when search genuinely returns zero pages.** It is NEVER
+a fallback for a failed `notion-update-page` (see Step 4 guardrail 3): an update failure
+means you have a real page but used the wrong id, and creating then would duplicate it and
+orphan the Zoom transcript link. Distinguish "no page exists" (create) from "update failed"
+(re-search, never create).
 
 ---
 
@@ -198,10 +243,12 @@ Do NOT change the page title or any properties — only the content body.
    in `new_str` as `<page url="...">Title</page>` blocks at the appropriate point,
    then retry. Do NOT set `allow_deleting_content: true` unless you're certain there's
    nothing to preserve.
-3. **Never call `mcp__notion__notion-create-pages` as a fallback.** Creating a new
-   page produces a duplicate and orphans the original page (which still holds the
-   underlying Zoom transcript link via its `<meeting-notes readOnlyViewMeetingNoteUrl>`
-   wrapper). If update fails, fix Step 2 and retry — don't paper over by creating.
+3. **Never call `mcp__notion__notion-create-pages` as a fallback for a failed update.**
+   An update failure means a real page exists but you have the wrong id — creating then
+   produces a duplicate and orphans the original page (which still holds the underlying
+   Zoom transcript link via its `<meeting-notes readOnlyViewMeetingNoteUrl>` wrapper). If
+   update fails, fix Step 2 and retry — don't paper over by creating. (Creating is allowed
+   ONLY in Step 2, when search genuinely returns zero pages — a distinct, deliberate path.)
 
 After a successful update, confirm to the user: meeting title, date, Notion page URL,
 and a one-line note that the page was updated (not created).
@@ -306,6 +353,27 @@ the meeting page is still useful. Report to the user which sub-step failed
 
 ---
 
+### Step 6 — Mark the email processed (commit)
+
+**Only now**, after Step 4 wrote the page AND Step 5 filed it (or, for a created
+page, after the index link is in), mark that meeting's Gmail id processed:
+
+```bash
+python3 /Users/galen.pewtherer/Claude/meeting-notes/scripts/fetch_zoom_emails.py --mark <gmail_id>
+```
+
+Mark **only** the `gmail_id`s that fully succeeded. Do this per-meeting (or pass
+several ids at once at the end, but never mark a meeting you skipped, blocked on,
+or only partially filed).
+
+**Why this matters (audit C1):** fetching no longer marks emails processed. If you
+mark before a successful write, a failed/blocked/skipped meeting is dropped forever
+and never resurfaces. Leaving an unfiled meeting unmarked lets the next run retry it.
+If a meeting was intentionally skipped (e.g. insufficient-transcript with no page),
+do NOT mark it unless you want it to stop resurfacing — say so in your report.
+
+---
+
 ## No-Zoom-assets mode (runner-invoked)
 
 The polling runner (`run_due_meeting_notes.py`) may invoke the skill with a
@@ -326,8 +394,10 @@ When you see that prompt, follow it exactly:
    that no content sources were available.
 5. **Step 4** — write the page with the no-Zoom callout the prompt provided
    prepended at the very top of `new_str`. Everything else (use `notion-search`
-   page ID, use `replace_content`, do not call `notion-create-pages`) is
-   unchanged.
+   page ID, use `replace_content`) is unchanged. Step 2's create-if-genuinely-absent
+   path still applies if no Notion page exists at all.
+6. **Skip Step 6** (no `gmail_id` to mark — Step 1 was skipped). The runner tracks
+   this meeting's status via its own schedule queue, not `processed_ids.json`.
 
 This mode is the planned exit when the runner has exhausted its Zoom-assets
 retries; Zoom occasionally delays the recap email beyond the runner's polling
@@ -338,9 +408,12 @@ silently dropping the synthesis.
 
 ## Notes
 
-- Processed Gmail IDs are stored in `scripts/processed_ids.json` — already-processed
-  meetings won't be returned by the script on subsequent runs
-- If a Notion page cannot be found for a meeting, skip it and report to the user
+- Processed Gmail IDs are stored in `scripts/processed_ids.json`. Fetching does NOT
+  add to it — only the Step 6 `--mark` commit does, after a successful write + file.
+  Already-marked meetings won't be returned on subsequent runs.
+- If a Notion page cannot be found, follow Step 2's no-page logic: re-search by
+  participants for generic titles, then create-if-genuinely-absent, or skip only when
+  there's no content in either source.
 - Never modify Notion pages from other databases — only meeting note pages
 - The script lives at `/Users/galen.pewtherer/Claude/meeting-notes/scripts/fetch_zoom_emails.py`
   and works from any working directory

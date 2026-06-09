@@ -21,6 +21,16 @@ Output (stdout): JSON array of meeting objects:
 
 Processed emails are tracked in processed_ids.json so they are not returned again.
 Pass --all to ignore the processed list and return everything.
+
+IMPORTANT (deferred marking): fetching does NOT mark emails processed. An email is
+marked processed only when the caller explicitly commits it AFTER the meeting note
+was successfully written + filed:
+
+    python3 scripts/fetch_zoom_emails.py --mark <gmail_id> [<gmail_id> ...]
+
+This prevents the historical data-loss bug where an email was marked processed at
+fetch time but the Notion write then failed/was-skipped, so the meeting was dropped
+permanently and never resurfaced.
 """
 
 import os
@@ -143,7 +153,22 @@ def main():
     parser.add_argument("--since", help="Only emails on or after YYYY-MM-DD (default: 30 days ago)")
     parser.add_argument("--limit", type=int, default=20, help="Max emails to fetch (default: 20)")
     parser.add_argument("--all", action="store_true", dest="fetch_all", help="Ignore processed list")
+    parser.add_argument("--mark", nargs="+", metavar="GMAIL_ID",
+                        help="Mark the given Gmail IDs as processed and exit. Call this "
+                             "AFTER a meeting note is successfully written + filed.")
     args = parser.parse_args()
+
+    # Deferred-marking commit path: add IDs to processed_ids.json and exit. This is
+    # the ONLY place that mutates the processed list — fetching never marks.
+    if args.mark:
+        processed = load_processed()
+        before = len(processed)
+        processed |= set(args.mark)
+        save_processed(processed)
+        print(json.dumps({"marked": sorted(set(args.mark)),
+                          "processed_total": len(processed),
+                          "added": len(processed) - before}, indent=2))
+        return
 
     since = args.since or (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     since_ts = datetime.strptime(since, "%Y-%m-%d").strftime("%Y/%m/%d")
@@ -164,7 +189,6 @@ def main():
     messages  = results.get("messages", [])
     processed = load_processed() if not args.fetch_all else set()
     output    = []
-    new_ids   = set()
 
     for msg_meta in messages:
         msg_id = msg_meta["id"]
@@ -186,12 +210,10 @@ def main():
             "date":         meeting_date,
             "zoom_summary": zoom_summary,
         })
-        new_ids.add(msg_id)
 
-    # Update processed list
-    if not args.fetch_all and new_ids:
-        save_processed(processed | new_ids)
-
+    # NOTE: fetching deliberately does NOT mark emails processed. The caller commits
+    # each ID via `--mark <gmail_id>` only after the note is written + filed. This
+    # keeps unfiled meetings resurfacing on the next run instead of being dropped.
     print(json.dumps(output, indent=2, ensure_ascii=False))
 
 
