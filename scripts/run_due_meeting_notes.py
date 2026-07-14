@@ -42,6 +42,8 @@ LOG_PREFIX    = "[run_due_meeting_notes]"
 CLAUDE        = "/Users/galen.pewtherer/.local/bin/claude"
 MEETING_NOTES_DIR = "/Users/galen.pewtherer/Claude/meeting-notes"
 RUN_LOG       = "/tmp/meeting-notes-poller.log"
+PENDING_DIR   = Path("/tmp/meeting-notes-pending")
+APPLY_SCRIPT  = str(SCRIPTS_DIR / "open_apply_pending.sh")
 MAX_LATENESS_MINUTES = 60
 ZOOM_RETRY_MINUTES   = 7
 ZOOM_MAX_ATTEMPTS    = 3
@@ -134,11 +136,34 @@ def should_notify(outcome):
     return outcome in ("blocked", "failed")
 
 
-def maybe_notify(outcome, title, date_str):
+def save_pending(meeting, date_str):
+    """Save blocked meeting metadata to PENDING_DIR for interactive retry."""
+    PENDING_DIR.mkdir(exist_ok=True)
+    title = meeting.get("title", "Untitled")
+    safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in title).strip()[:50]
+    fname = f"{date_str}_{safe.replace(' ', '_')}.json"
+    payload = {
+        "title": title,
+        "date": date_str,
+        "no_zoom": int(meeting.get("zoom_check_attempts", 0)) >= ZOOM_MAX_ATTEMPTS,
+        "blocked_at": datetime.now().isoformat(),
+    }
+    (PENDING_DIR / fname).write_text(json.dumps(payload, indent=2))
+    log(f"Saved pending note: {fname}")
+
+
+def maybe_notify(outcome, title, date_str, meeting=None):
     if not should_notify(outcome):
         return
+    if outcome == "blocked" and meeting is not None:
+        save_pending(meeting, date_str)
     head = "Meeting notes: write blocked" if outcome == "blocked" else "Meeting notes: run failed"
-    notify(head, f"'{title}' ({date_str}): {outcome}; synthesis not filed, finish manually")
+    if outcome == "blocked":
+        msg = f"'{title}' ({date_str}): click Apply to open Claude and finish the write"
+        notify(head, msg, execute=APPLY_SCRIPT, action_label="Apply")
+    else:
+        msg = f"'{title}' ({date_str}): run failed"
+        notify(head, msg)
 
 
 def log(msg):
@@ -243,7 +268,7 @@ def no_zoom_prompt(title, date_str):
         f"the synthesis from the Notion AI content alone and prepend this "
         f"callout at the very top of the page body:\n\n"
         f"> ⚠️ No Zoom AI assets were available for this meeting "
-        f"(no recap email in Gmail after two checks). Synthesis below is "
+        f"(no recap email in Gmail after {ZOOM_MAX_ATTEMPTS} checks). Synthesis below is "
         f"sourced from the Notion AI content only."
         + RESULT_SENTINEL_INSTRUCTION
     )
@@ -312,7 +337,7 @@ def main():
             status = status_for(outcome, no_zoom=False)
             m["status"] = status
             counters[status] = counters.get(status, 0) + 1
-            maybe_notify(outcome, title, meeting_date.isoformat())
+            maybe_notify(outcome, title, meeting_date.isoformat(), m)
         else:
             if attempts < ZOOM_MAX_ATTEMPTS - 1:
                 log(f"No Zoom assets for '{title}' (attempt {attempts + 1}/"
@@ -329,7 +354,7 @@ def main():
                 status = status_for(outcome, no_zoom=True)
                 m["status"] = status
                 counters[status] = counters.get(status, 0) + 1
-                maybe_notify(outcome, title, meeting_date.isoformat())
+                maybe_notify(outcome, title, meeting_date.isoformat(), m)
 
         changed = True
 
