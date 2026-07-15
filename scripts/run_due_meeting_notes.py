@@ -4,22 +4,18 @@ Polled by launchd (com.galen.meeting-notes-runner) every few minutes. Reads the
 queue file written by schedule_meeting_notes.py and invokes the meeting-notes
 skill for any meeting whose trigger_time has arrived.
 
-Before invoking the skill, checks Gmail for a matching "Meeting assets" email
-from Zoom. If absent, postpones the trigger by ZOOM_RETRY_MINUTES and bumps a
-retry counter. After ZOOM_MAX_ATTEMPTS attempts without a Zoom email, invokes
-the skill in a "no Zoom assets" mode that flags the Notion page and synthesizes
-from Notion AI content alone.
+Synthesizes from Notion AI content only — no Zoom email check or retry loop.
+Each due meeting gets one Claude invocation via notion_only_prompt(); outcome is
+classified from the skill's stdout sentinel line.
 
 Replaces the previous `at`-based scheduling which fails on modern macOS without
 Full Disk Access.
 
 Meeting status transitions:
-  pending → fired              (Zoom assets present; skill wrote + filed the note)
-  pending → fired_no_zoom      (Zoom assets missing after retries; skill wrote
-                                from Notion AI content with no-Zoom callout)
+  pending → fired              (skill wrote + filed the note)
   pending → blocked            (skill ran but a Notion write was blocked/denied on
                                 a permission grant; nothing filed; macOS alert fired)
-  pending → skipped            (skill ran but found no Notion page to write to)
+  pending → skipped            (skill ran but found no Notion page or empty summary)
   pending → failed             (claude invoked, non-zero exit; macOS alert fired)
   pending → missed             (trigger more than MAX_LATENESS_MINUTES late;
                                 never attempted)
@@ -27,6 +23,9 @@ Meeting status transitions:
 NOTE: a 0 exit code no longer implies success — the headless skill exits 0 even
 when blocked on permission, so outcomes are classified from its output (see
 classify_outcome).
+
+Legacy Zoom functions (gmail_service, zoom_asset_exists, reschedule,
+normal_prompt, no_zoom_prompt) are kept below for reference but are not called.
 """
 import json
 import os
@@ -124,7 +123,7 @@ def classify_outcome(rc, output):
     return "success"
 
 
-def status_for(outcome, no_zoom):
+def status_for(outcome, no_zoom=False):
     """Queue status string for a classified outcome."""
     if outcome == "success":
         return "fired_no_zoom" if no_zoom else "fired"
@@ -145,6 +144,8 @@ def save_pending(meeting, date_str):
     payload = {
         "title": title,
         "date": date_str,
+        # no_zoom is always False in the Notion-only flow (zoom_check_attempts is
+        # never set); kept in the payload for schema compatibility with older files.
         "no_zoom": int(meeting.get("zoom_check_attempts", 0)) >= ZOOM_MAX_ATTEMPTS,
         "blocked_at": datetime.now().isoformat(),
     }
@@ -254,6 +255,18 @@ RESULT_SENTINEL_INSTRUCTION = (
 )
 
 
+def notion_only_prompt(title, date_str):
+    return (
+        f"Run the meeting-notes skill for the meeting titled \"{title}\" "
+        f"on {date_str}. Use the Notion AI content as the sole synthesis input. "
+        f"Do not create a page if no Notion page exists or the summary is empty — "
+        f"stop and output the SKIPPED sentinel instead. "
+        f"Process ONLY this one meeting — do not process other meetings you may find."
+        + RESULT_SENTINEL_INSTRUCTION
+    )
+
+
+# Legacy prompts kept for reference — superseded by notion_only_prompt above.
 def normal_prompt(title, date_str):
     return (
         f"Run the meeting-notes skill for the meeting titled \"{title}\" "
@@ -304,10 +317,8 @@ def main():
 
     now = datetime.now().astimezone()
     cutoff = now - timedelta(minutes=MAX_LATENESS_MINUTES)
-    service = None
     changed = False
-    counters = {"fired": 0, "fired_no_zoom": 0, "blocked": 0, "skipped": 0,
-                "missed": 0, "failed": 0, "retried": 0}
+    counters = {"fired": 0, "blocked": 0, "skipped": 0, "missed": 0, "failed": 0}
 
     for m in meetings:
         if m.get("status") != "pending":
@@ -328,41 +339,12 @@ def main():
             changed = True
             continue
 
-        if service is None:
-            try:
-                service = gmail_service()
-            except Exception as e:
-                log(f"Cannot init Gmail client: {e}; firing without Zoom check")
-                service = False
-
-        attempts = int(m.get("zoom_check_attempts", 0))
-        has_zoom = bool(service) and zoom_asset_exists(service, title, meeting_date)
-
-        if has_zoom:
-            rc, output = invoke_claude(normal_prompt(title, meeting_date.isoformat()), title)
-            outcome = classify_outcome(rc, output)
-            status = status_for(outcome, no_zoom=False)
-            m["status"] = status
-            counters[status] = counters.get(status, 0) + 1
-            maybe_notify(outcome, title, meeting_date.isoformat(), m)
-        else:
-            if attempts < ZOOM_MAX_ATTEMPTS - 1:
-                log(f"No Zoom assets for '{title}' (attempt {attempts + 1}/"
-                    f"{ZOOM_MAX_ATTEMPTS}); rescheduling in {ZOOM_RETRY_MINUTES}m")
-                reschedule(m, attempts + 1)
-                counters["retried"] += 1
-            else:
-                log(f"No Zoom assets for '{title}' after {ZOOM_MAX_ATTEMPTS} "
-                    f"attempts; invoking with no-Zoom callout")
-                rc, output = invoke_claude(
-                    no_zoom_prompt(title, meeting_date.isoformat()), title
-                )
-                outcome = classify_outcome(rc, output)
-                status = status_for(outcome, no_zoom=True)
-                m["status"] = status
-                counters[status] = counters.get(status, 0) + 1
-                maybe_notify(outcome, title, meeting_date.isoformat(), m)
-
+        rc, output = invoke_claude(notion_only_prompt(title, meeting_date.isoformat()), title)
+        outcome = classify_outcome(rc, output)
+        status = status_for(outcome)
+        m["status"] = status
+        counters[status] = counters.get(status, 0) + 1
+        maybe_notify(outcome, title, meeting_date.isoformat(), m)
         changed = True
 
     if changed:
