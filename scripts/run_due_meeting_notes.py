@@ -254,8 +254,15 @@ RESULT_SENTINEL_INSTRUCTION = (
 )
 
 
-def normal_prompt():
-    return "run the meeting notes skill." + RESULT_SENTINEL_INSTRUCTION
+def normal_prompt(title, date_str):
+    return (
+        f"Run the meeting-notes skill for the meeting titled \"{title}\" "
+        f"on {date_str}. Zoom AI assets are available in Gmail for this "
+        f"meeting. In Step 1, run fetch_zoom_emails.py and select the email "
+        f"that matches this meeting title and date. Process ONLY this one "
+        f"meeting — do not process other unprocessed meetings you may find."
+        + RESULT_SENTINEL_INSTRUCTION
+    )
 
 
 def no_zoom_prompt(title, date_str):
@@ -332,7 +339,7 @@ def main():
         has_zoom = bool(service) and zoom_asset_exists(service, title, meeting_date)
 
         if has_zoom:
-            rc, output = invoke_claude(normal_prompt(), title)
+            rc, output = invoke_claude(normal_prompt(title, meeting_date.isoformat()), title)
             outcome = classify_outcome(rc, output)
             status = status_for(outcome, no_zoom=False)
             m["status"] = status
