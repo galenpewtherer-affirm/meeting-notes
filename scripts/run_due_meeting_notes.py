@@ -8,6 +8,13 @@ Synthesizes from Notion AI content only — no Zoom email check or retry loop.
 Each due meeting gets one Claude invocation via notion_only_prompt(); outcome is
 classified from the skill's stdout sentinel line.
 
+Claude runs inside a detached tmux session (see invoke_claude), not `claude -p`.
+`-p` print mode auto-denies every tool in the permissions 'ask' list (Notion
+writes included) with no hook consultation — verified 2026-07-16. A real
+interactive session, even fully unattended inside tmux, keeps the
+PermissionRequest hook path alive, so ~/.claude/scripts/auto-approve-notion.py
+can actually auto-approve the Notion write tools that were blocking every run.
+
 Replaces the previous `at`-based scheduling which fails on modern macOS without
 Full Disk Access.
 
@@ -29,8 +36,10 @@ normal_prompt, no_zoom_prompt) are kept below for reference but are not called.
 """
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -39,6 +48,7 @@ SCHEDULE_FILE = Path.home() / ".meeting-notes-schedule.json"
 GMAIL_TOKEN   = SCRIPTS_DIR / "gmail_token.json"
 LOG_PREFIX    = "[run_due_meeting_notes]"
 CLAUDE        = "/Users/galen.pewtherer/.local/bin/claude"
+TMUX          = "/opt/homebrew/bin/tmux"
 MEETING_NOTES_DIR = "/Users/galen.pewtherer/Claude/meeting-notes"
 RUN_LOG       = "/tmp/meeting-notes-poller.log"
 PENDING_DIR   = Path("/tmp/meeting-notes-pending")
@@ -46,10 +56,12 @@ APPLY_SCRIPT  = str(SCRIPTS_DIR / "open_apply_pending.sh")
 MAX_LATENESS_MINUTES = 60
 ZOOM_RETRY_MINUTES   = 7
 ZOOM_MAX_ATTEMPTS    = 3
-# Hard cap on a single headless skill run. Without this a wedged `claude`
-# invocation blocks the poller indefinitely and starves every later meeting in
-# the queue. A timeout is killed, classified `failed`, and alerts (see main).
+# Hard cap on a single run. Without this a wedged `claude` invocation blocks
+# the poller indefinitely and starves every later meeting in the queue. A
+# timeout kills the tmux session, classified `failed`, and alerts (see main).
 CLAUDE_TIMEOUT_SECONDS = 900
+# How often to poll the tmux pane for the RESULT: sentinel.
+POLL_INTERVAL_SECONDS = 3
 GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # macOS notification helper (dependency-free osascript) lives with the peak-events
@@ -101,6 +113,20 @@ def _as_text(v):
     return v
 
 
+def _last_assistant_text(output):
+    """Return the tail of `output` after the last '⏺' (Claude Code's assistant-
+    turn marker). Everything before it is either the echoed user prompt (tmux
+    pty captures echo the input line, unlike the old `-p` capture) or an
+    earlier turn — and RESULT_SENTINEL_INSTRUCTION itself contains the literal
+    strings 'RESULT: SUCCESS' / 'BLOCKED' / 'SKIPPED', so scanning the whole
+    blob false-matches before the agent has done anything. Falls back to the
+    full text when no marker is present (e.g. old `-p`-captured logs, which
+    never echoed the prompt in the first place)."""
+    text = output or ""
+    last_bullet = text.rfind("⏺")
+    return text[last_bullet:] if last_bullet != -1 else text
+
+
 def classify_outcome(rc, output):
     """Map (exit code, skill stdout+stderr) to: failed | blocked | skipped | success.
 
@@ -109,7 +135,7 @@ def classify_outcome(rc, output):
     Defaults to 'success' so a clean run with no markers is still recorded fired."""
     if rc != 0:
         return "failed"
-    text = (output or "").lower()
+    text = _last_assistant_text(output).lower()
     if "result: success" in text:
         return "success"
     if "result: blocked" in text:
@@ -210,33 +236,92 @@ def zoom_asset_exists(service, meeting_title, meeting_date):
         return False
 
 
+# Dedicated socket so this runner's sessions never collide with (or get
+# accidentally killed alongside) any tmux server Galen runs interactively.
+TMUX_SOCKET = "meeting_notes_runner"
+
+
+def _tmux(*args):
+    """Run a tmux subcommand on the dedicated socket. Returns (returncode, stdout+stderr)."""
+    result = subprocess.run(
+        [TMUX, "-L", TMUX_SOCKET, *args], capture_output=True, text=True,
+    )
+    return result.returncode, _as_text(result.stdout) + _as_text(result.stderr)
+
+
+def _has_result_sentinel(pane_text):
+    """True if the RESULT: sentinel appears in the most recent assistant turn
+    (see _last_assistant_text) rather than merely echoed back as part of the
+    prompt instructions Claude Code displays above the input box."""
+    if pane_text.rfind("⏺") == -1:
+        return False
+    return "result:" in _last_assistant_text(pane_text).lower()
+
+
 def invoke_claude(prompt, title):
-    """Run the skill headlessly. Returns (returncode, combined_output). The output
-    is captured (not just streamed) so the caller can classify whether the run
-    actually completed the Notion write or merely exited 0 while blocked."""
-    log(f"Invoking claude for '{title}'")
-    # Inherit the launchd environment so claude can access the macOS Keychain
-    # OAuth credential. The XPC_* and session env vars launchd injects are
-    # required for keychain reads from a non-tty process — building env from
-    # scratch (as an earlier version of this script did) breaks claude with
-    # "Not logged in".
-    env = {**os.environ, "HOME": str(Path.home())}
+    """Run the skill in a detached tmux session (a real pty) rather than `claude -p`.
+
+    `-p` print mode auto-denies any tool in the permissions 'ask' list with no
+    hook consultation — verified empirically 2026-07-16 (see meeting-notes
+    CLAUDE.md history / recent_activity.md). A real interactive session, even
+    fully unattended inside tmux, keeps the PermissionRequest hook path alive:
+    ~/.claude/scripts/auto-approve-notion.py auto-approves the Notion write
+    tools that were blocking every headless run. Returns (returncode,
+    combined_output) in the same shape callers already expect from the old
+    subprocess-based implementation.
+    """
+    log(f"Invoking claude (tmux) for '{title}'")
+    session = f"meeting_notes_{os.getpid()}_{int(time.time())}"
+
+    # Single shell string so the prompt is submitted as claude's first message
+    # at launch (avoids a separate readiness-detection step before send-keys).
+    # shlex.quote handles any quotes/special characters in the meeting title.
+    shell_cmd = (
+        f"cd {shlex.quote(MEETING_NOTES_DIR)} && "
+        f"HOME={shlex.quote(str(Path.home()))} "
+        f"{shlex.quote(CLAUDE)} {shlex.quote(prompt)}"
+    )
+
+    rc_create, create_out = _tmux(
+        "new-session", "-d", "-s", session, "-x", "220", "-y", "50", shell_cmd
+    )
+    if rc_create != 0:
+        log(f"tmux new-session failed for '{title}': {create_out}")
+        return 1, f"[runner] tmux new-session failed: {create_out}"
+
+    # Keep the pane alive after claude exits (crash, early error) so the final
+    # screen can still be captured instead of vanishing with the session.
+    _tmux("set-option", "-t", session, "remain-on-exit", "on")
+
+    output = ""
+    rc = 0
+    deadline = time.time() + CLAUDE_TIMEOUT_SECONDS
     try:
-        result = subprocess.run(
-            [CLAUDE, "-p", prompt, "--dangerously-skip-permissions"],
-            cwd=MEETING_NOTES_DIR,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=CLAUDE_TIMEOUT_SECONDS,
-        )
-        rc = result.returncode
-        output = _as_text(result.stdout) + _as_text(result.stderr)
-    except subprocess.TimeoutExpired as e:
-        rc = 124
-        output = (_as_text(e.stdout) + _as_text(e.stderr)
-                  + f"\n[runner] TIMEOUT after {CLAUDE_TIMEOUT_SECONDS}s; process killed.")
-        log(f"claude timed out after {CLAUDE_TIMEOUT_SECONDS}s for '{title}'")
+        while time.time() < deadline:
+            time.sleep(POLL_INTERVAL_SECONDS)
+            has_session_rc, _ = _tmux("has-session", "-t", session)
+            _, pane = _tmux("capture-pane", "-t", session, "-p", "-S", "-500")
+            output = pane
+            if _has_result_sentinel(pane):
+                # Debounce: grab one more capture in case trailing UI chrome
+                # (footer redraw) is still settling.
+                time.sleep(1.5)
+                _, pane2 = _tmux("capture-pane", "-t", session, "-p", "-S", "-500")
+                output = pane2
+                rc = 0
+                break
+            if has_session_rc != 0:
+                # Session ended without ever printing a RESULT: sentinel.
+                rc = 1
+                output += "\n[runner] tmux session ended without a RESULT: sentinel."
+                break
+        else:
+            rc = 124
+            output += f"\n[runner] TIMEOUT after {CLAUDE_TIMEOUT_SECONDS}s; session killed."
+            log(f"claude timed out after {CLAUDE_TIMEOUT_SECONDS}s for '{title}'")
+    finally:
+        _tmux("kill-session", "-t", session)
+
     with open(RUN_LOG, "a") as runlog:
         runlog.write(f"\n===== {datetime.now().isoformat()} '{title}' =====\n")
         runlog.write(output)
@@ -257,8 +342,12 @@ RESULT_SENTINEL_INSTRUCTION = (
 
 def notion_only_prompt(title, date_str):
     return (
-        f"Run the meeting-notes skill for the meeting titled \"{title}\" "
-        f"on {date_str}. Use the Notion AI content as the sole synthesis input. "
+        f"Follow the meeting-notes workflow already loaded from this directory's "
+        f"CLAUDE.md — it is in your context, execute its steps directly. Do NOT "
+        f"invoke any Skill tool (in particular, do not use the tpm:meeting-notes "
+        f"plugin skill — that is a different, unrelated workflow). "
+        f"Process the meeting titled \"{title}\" on {date_str}. "
+        f"Use the Notion AI content as the sole synthesis input. "
         f"Do not create a page if no Notion page exists or the summary is empty — "
         f"stop and output the SKIPPED sentinel instead. "
         f"Process ONLY this one meeting — do not process other meetings you may find."
