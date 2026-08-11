@@ -62,6 +62,14 @@ check("no-sentinel + stray grant phrase -> blocked (fail-safe)",
 # Timeout path produces rc=124 -> failed (invoke_claude maps TimeoutExpired to rc 124).
 check("timeout rc 124 -> failed", r.classify_outcome(124, "[runner] TIMEOUT after 900s; process killed."), "failed")
 
+# PARTIAL sentinel: Steps 1-4 succeeded but Step 5 (hub cross-post) failed. Must
+# still trigger the alert path — a silent PARTIAL is the same class of bug as the
+# original silent-block bug (RESULT: SUCCESS printed when work is incomplete).
+check("explicit PARTIAL",
+      r.classify_outcome(0, "...\nRESULT: PARTIAL hub write failed: validation_error"),
+      "partial")
+check("notify on partial", r.should_notify("partial"), True)
+
 # --- _as_text(v) ---
 check("_as_text None", r._as_text(None), "")
 check("_as_text str", r._as_text("hi"), "hi")

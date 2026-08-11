@@ -20,6 +20,8 @@ Full Disk Access.
 
 Meeting status transitions:
   pending → fired              (skill wrote + filed the note)
+  pending → partial            (note written + filed (Steps 1-4 OK) but Step 5's
+                                1:1 hub cross-post failed; macOS alert fired)
   pending → blocked            (skill ran but a Notion write was blocked/denied on
                                 a permission grant; nothing filed; macOS alert fired)
   pending → skipped            (skill ran but found no Notion page or empty summary)
@@ -128,16 +130,22 @@ def _last_assistant_text(output):
 
 
 def classify_outcome(rc, output):
-    """Map (exit code, skill stdout+stderr) to: failed | blocked | skipped | success.
+    """Map (exit code, skill stdout+stderr) to: failed | blocked | skipped | partial | success.
 
     rc != 0 is always 'failed'. Otherwise prefer the explicit `RESULT:` sentinel
     the skill is asked to print, then fall back to known block/skip phrasing.
-    Defaults to 'success' so a clean run with no markers is still recorded fired."""
+    Defaults to 'success' so a clean run with no markers is still recorded fired.
+
+    'partial' covers Step 5 (hub cross-post) failing after Steps 1-4 succeeded —
+    the meeting note itself was written and filed, but the skill's own contract
+    was not fully satisfied, so this must still alert (see should_notify)."""
     if rc != 0:
         return "failed"
     text = _last_assistant_text(output).lower()
     if "result: success" in text:
         return "success"
+    if "result: partial" in text:
+        return "partial"
     if "result: blocked" in text:
         return "blocked"
     if "result: skipped" in text:
@@ -153,12 +161,16 @@ def status_for(outcome, no_zoom=False):
     """Queue status string for a classified outcome."""
     if outcome == "success":
         return "fired_no_zoom" if no_zoom else "fired"
-    return outcome  # blocked | skipped | failed
+    return outcome  # blocked | skipped | failed | partial
 
 
 def should_notify(outcome):
-    """Whether to fire a macOS notification so Galen can finish the run manually."""
-    return outcome in ("blocked", "failed")
+    """Whether to fire a macOS notification so Galen can finish the run manually.
+
+    'partial' (Step 5 hub cross-post failed after Steps 1-4 succeeded) must alert
+    too — otherwise a Step-5-only failure prints RESULT: SUCCESS-equivalent silence
+    and nobody knows the hub update needs to be finished by hand."""
+    return outcome in ("blocked", "failed", "partial")
 
 
 def save_pending(meeting, date_str):
@@ -184,11 +196,18 @@ def maybe_notify(outcome, title, date_str, meeting=None):
         return
     if outcome == "blocked" and meeting is not None:
         save_pending(meeting, date_str)
-    head = "Meeting notes: write blocked" if outcome == "blocked" else "Meeting notes: run failed"
     if outcome == "blocked":
+        head = "Meeting notes: write blocked"
         msg = f"'{title}' ({date_str}): click Apply to open Claude and finish the write"
         notify(head, msg, execute=APPLY_SCRIPT, action_label="Apply")
+    elif outcome == "partial":
+        # Steps 1-4 succeeded (note written + filed) but Step 5's hub cross-post
+        # failed — distinct from a real run failure, so the message says so.
+        head = "Meeting notes: hub update failed"
+        msg = f"'{title}' ({date_str}): note filed, but the 1:1 hub cross-post failed — finish it manually"
+        notify(head, msg)
     else:
+        head = "Meeting notes: run failed"
         msg = f"'{title}' ({date_str}): run failed"
         notify(head, msg)
 
@@ -334,8 +353,9 @@ def invoke_claude(prompt, title):
 RESULT_SENTINEL_INSTRUCTION = (
     " When you are completely done, print as the very last line exactly one of: "
     "'RESULT: SUCCESS' if the synthesis was written to the Notion page and the page "
-    "was filed/re-parented; 'RESULT: BLOCKED <reason>' if any Notion write was "
-    "blocked, denied, or left pending on a permission grant; or "
+    "was filed/re-parented; 'RESULT: PARTIAL <reason>' if that succeeded but Step 5 "
+    "(the 1:1 hub cross-post) failed; 'RESULT: BLOCKED <reason>' if any Notion write "
+    "was blocked, denied, or left pending on a permission grant; or "
     "'RESULT: SKIPPED <reason>' if there was no Notion page to write to."
 )
 

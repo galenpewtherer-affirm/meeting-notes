@@ -272,8 +272,11 @@ never has to do this by hand.
      lot") exactly where they are — never reorder them relative to the dated headings
      around them.
 6. This step is additive only — it never moves or re-parents the meeting note itself
-   (Step 4b already filed it correctly in the general index). If this step fails,
-   report it but do not undo Steps 1-4.
+   (Step 4b already filed it correctly in the general index). If this step fails, do
+   not undo Steps 1-4 — the meeting note itself is already written and filed. Instead,
+   print `RESULT: PARTIAL <reason>` as the final line instead of `RESULT: SUCCESS`, so
+   the headless runner (`run_due_meeting_notes.py`) alerts Galen to finish the hub
+   update manually rather than silently reporting a clean success.
 
 ---
 
@@ -283,8 +286,10 @@ never has to do this by hand.
   If `<summary>` is empty the meeting had no usable transcript — skip it.
 - Never modify Notion pages from other databases — only meeting note pages.
 - The runner (`run_due_meeting_notes.py`) triggers this skill headlessly via launchd.
-  Print `RESULT: SUCCESS`, `RESULT: BLOCKED <reason>`, or `RESULT: SKIPPED <reason>`
-  as the very last line so the runner can classify the outcome.
+  Print `RESULT: SUCCESS`, `RESULT: PARTIAL <reason>`, `RESULT: BLOCKED <reason>`, or
+  `RESULT: SKIPPED <reason>` as the very last line so the runner can classify the
+  outcome. `PARTIAL` covers Steps 1-4 succeeding but Step 5 failing — the runner
+  alerts on it exactly like `BLOCKED`/`FAILED` (see Step 5, item 6).
 - **Never call `notion-create-pages` at any point in this workflow.** Only update
   pages that Notion AI created from a live transcript. If no page exists or the
   summary is empty, skip — there is nothing to synthesize.
