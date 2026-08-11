@@ -7,3 +7,4 @@ scripts/processed_ids.json
 
 # Python caches
 scripts/__pycache__/
+.worktrees/
