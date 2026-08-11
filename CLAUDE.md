@@ -216,6 +216,67 @@ be completed manually.
 
 ---
 
+### Step 5 — Update the counterpart's personal 1:1 hub (1:1s only)
+
+Skip this step entirely unless Step 4b classified the meeting into **1:1s (various)**
+(`121f6d7d163043a3a1ec7e0cab4b7351`) — i.e. the title contains `/`, `|`, `1:1`,
+`(Weekly)`, or `(Bi-Weekly)`. Non-1:1 meetings (program syncs, planning meetings) never
+touch this step.
+
+**Purpose:** Galen keeps a personal running-notes hub per stakeholder (manager,
+leadership, Infra stakeholders — *not* direct reports, who live under "My Team"
+instead) under the **"1:1s"** parent page (`37540e54ae38815b80aef7bd63c6ee11`). When a
+1:1 with one of these people gets filed, also add a dated block to their hub so Galen
+never has to do this by hand.
+
+1. **Extract the counterpart's name** from the meeting title — the attendee who isn't
+   Galen (e.g. "Daniel / Galen bi-weekly" → `Daniel`; "Mindy | Galen (Weekly)" → `Mindy`).
+2. **Fetch the "1:1s" parent page** (`37540e54ae38815b80aef7bd63c6ee11`) to get the
+   current list of stakeholder hub sub-pages — do this fresh each time rather than
+   hardcoding names/IDs, since stakeholders get added/removed over time.
+3. **Match** the counterpart's first name (case-insensitive) against each listed hub
+   page's title (`<Name> — 1:1s`). If no match, stop — most 1:1s (Adam, Nirmal, Chad,
+   Brian, Parker, Michael, etc.) don't have a dedicated hub page; this is expected and
+   not an error.
+4. **On a match**, fetch the hub page and condense the Step 3 synthesis (Action
+   Items / Quick Recap / Key Discussion Points / Additional Context) into this format:
+   ```
+   - *Their agenda / priorities:* ...
+   - *How Infra TPM can help / asks of me:* ...
+   - *Updates since last time:* ... (write "n/a (first 1:1)" if the hub has no prior dated blocks)
+   - *Key discussion:* ... (condensed Key Discussion Points / Additional Context)
+   - *Decisions & commitments:* ...
+   - *Action items (owner + due):*
+   	- <Owner>: <action>
+   - *Source:* <mention-page url="<meeting_page_url_from_Step_1>"/>
+   ```
+   Adapt field names/order to whatever that specific hub page's existing dated blocks
+   already use — match the established per-page convention, don't force a rigid schema.
+5. **Insert per-date, newest-first — one `##` heading per meeting, agenda then notes.**
+   Hub pages no longer use a separate "big agenda block, then big notes block"
+   structure; each meeting date gets its own top-level heading containing that date's
+   agenda (if one was captured) immediately followed by that date's notes.
+   - **If a same-dated agenda heading already exists** (e.g. `## August 4 1:1` or
+     `## 8/7 1:1`) with no notes under it yet, insert a `**Notes:**` bold line plus the
+     condensed block directly after that agenda's content, before the next `##` heading.
+     Rename the heading to drop any trailing "- agenda" suffix if present (it now covers
+     both agenda and notes).
+   - **If no matching agenda heading exists**, insert a new `## YYYY-MM-DD — <short topic
+     line>` heading in newest-first position (above the next-older dated heading), with
+     a `**Notes:**` bold line plus the condensed block underneath.
+   - If the only thing on the page is a stale placeholder line (e.g. `*Archive scan ...:
+     no prior 1:1 / meeting notes on file...*` or `*(add a dated ## heading with that
+     meeting's agenda + notes here after each 1:1)*`), replace that placeholder with the
+     new heading instead of leaving it alongside real content.
+   - Leave any non-dated standing sections (e.g. "At a glance", "TL;DR", "Later / parking
+     lot") exactly where they are — never reorder them relative to the dated headings
+     around them.
+6. This step is additive only — it never moves or re-parents the meeting note itself
+   (Step 4b already filed it correctly in the general index). If this step fails,
+   report it but do not undo Steps 1-4.
+
+---
+
 ## Notes
 
 - Notion AI populates the `<summary>` block automatically from the meeting transcript.
