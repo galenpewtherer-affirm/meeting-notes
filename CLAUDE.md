@@ -238,6 +238,18 @@ never has to do this by hand.
    page's title (`<Name> — 1:1s`). If no match, stop — most 1:1s (Adam, Nirmal, Chad,
    Brian, Parker, Michael, etc.) don't have a dedicated hub page; this is expected and
    not an error.
+   - **If more than one hub page matches the same first name** (e.g. "Chris A — 1:1s"
+     and "Chris B — 1:1s"), cross-check against the meeting's attendee list — pull the
+     attendee names/emails from the Notion AI page's metadata (calendar guest list
+     embedded in the source page) or the calendar event that triggered the run — and
+     match on last name / email to pick the correct hub page.
+   - **If still ambiguous after the attendee cross-check** (no attendee data available,
+     or it doesn't distinguish the candidates), use `AskUserQuestion` to ask Galen which
+     stakeholder this note belongs to. Never guess or silently pick the first match.
+     In a headless run (no interactive user to answer — see Notes on
+     `run_due_meeting_notes.py`), skip the hub update instead of calling
+     `AskUserQuestion`, and report `RESULT: PARTIAL ambiguous stakeholder match for
+     "<first name>" (<hub page titles>)` per item 6 below.
 4. **On a match**, fetch the hub page and condense the Step 3 synthesis (Action
    Items / Quick Recap / Key Discussion Points / Additional Context) into this format:
    ```
