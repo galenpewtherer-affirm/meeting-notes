@@ -92,7 +92,7 @@ check("no notify on skipped", r.should_notify("skipped"), False)
 # --- maybe_notify fires only on blocked/failed, with a useful message ---
 _calls = []
 _orig_notify = r.notify
-r.notify = lambda title, message: _calls.append((title, message))
+r.notify = lambda title, message, execute=None, action_label=None: _calls.append((title, message))
 try:
     r.maybe_notify("success", "Adam/Galen 1:1", "2026-06-01")
     r.maybe_notify("skipped", "Greg Office Hours", "2026-06-01")
