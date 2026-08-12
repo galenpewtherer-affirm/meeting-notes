@@ -1,3 +1,8 @@
+---
+name: meeting-notes-apply-pending
+description: "Re-run meeting notes that were blocked during a headless launchd run, in an interactive session where the Notion write permission can be approved. Use when: 'apply pending meeting notes', 'finish the blocked meeting note', 'process pending notes', or after a 'Meeting notes: write blocked' notification."
+---
+
 # Meeting Notes: Apply Pending
 
 Process meeting notes that were blocked during headless launchd runs. The runner
