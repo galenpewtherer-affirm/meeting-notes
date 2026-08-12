@@ -27,7 +27,7 @@ Meeting status transitions:
   pending → skipped            (skill ran but found no Notion page or empty summary)
   pending → failed             (claude invoked, non-zero exit; macOS alert fired)
   pending → missed             (trigger more than MAX_LATENESS_MINUTES late;
-                                never attempted)
+                                never attempted; macOS alert fired)
 
 NOTE: a 0 exit code no longer implies success — the headless skill exits 0 even
 when blocked on permission, so outcomes are classified from its output (see
@@ -70,11 +70,27 @@ GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
 # launchd tooling. Import defensively so a missing helper never breaks the runner.
 ALERT_DIR = SCRIPTS_DIR.parent.parent / "peak-events" / "scripts"
 sys.path.insert(0, str(ALERT_DIR))
+
+
+def _fallback_notify(title, message, execute=None, action_label=None):
+    """No-op stand-in used when peak-events' alert.notify can't be imported.
+
+    The signature MUST mirror alert.notify exactly — maybe_notify's blocked path
+    calls notify(..., execute=..., action_label=...), and a stub that only accepts
+    (title, message) raises TypeError there. That TypeError propagates out of
+    maybe_notify, out of main()'s per-meeting loop, and past the
+    SCHEDULE_FILE.write_text() that persists the queue — so every already-processed
+    meeting silently reverts to 'pending' and every later due meeting in the batch
+    is never attempted, with nothing surfaced. Returns False (never delivered) so
+    _notify() logs the lost banner, matching alert.notify's bool contract.
+    """
+    return False
+
+
 try:
     from alert import notify
 except Exception:
-    def notify(title, message):  # no-op fallback
-        pass
+    notify = _fallback_notify
 
 # Phrases indicating the skill could NOT complete the Notion write. The headless
 # skill exits 0 even when a write is blocked pending a permission grant, so exit
@@ -138,18 +154,27 @@ def classify_outcome(rc, output):
 
     'partial' covers Step 5 (hub cross-post) failing after Steps 1-4 succeeded —
     the meeting note itself was written and filed, but the skill's own contract
-    was not fully satisfied, so this must still alert (see should_notify)."""
+    was not fully satisfied, so this must still alert (see should_notify).
+
+    Sentinel precedence is deliberately incomplete-work-first (blocked > partial >
+    skipped > success), NOT success-first. An LLM final turn routinely narrates the
+    sentinel it is *not* printing ("normally I'd print RESULT: SUCCESS, but the hub
+    write failed, so: RESULT: PARTIAL ..."), and a success-first check matches that
+    stray mention and silently records a fully successful run — reintroducing exactly
+    the silent-drop bug this function exists to prevent. Biasing toward the
+    alerting outcome can only over-notify, which is recoverable; under-notifying in
+    an unattended launchd run is not."""
     if rc != 0:
         return "failed"
     text = _last_assistant_text(output).lower()
-    if "result: success" in text:
-        return "success"
-    if "result: partial" in text:
-        return "partial"
     if "result: blocked" in text:
         return "blocked"
+    if "result: partial" in text:
+        return "partial"
     if "result: skipped" in text:
         return "skipped"
+    if "result: success" in text:
+        return "success"
     if any(p in text for p in BLOCK_PHRASES):
         return "blocked"
     if any(p in text for p in SKIP_PHRASES):
@@ -169,8 +194,15 @@ def should_notify(outcome):
 
     'partial' (Step 5 hub cross-post failed after Steps 1-4 succeeded) must alert
     too — otherwise a Step-5-only failure prints RESULT: SUCCESS-equivalent silence
-    and nobody knows the hub update needs to be finished by hand."""
-    return outcome in ("blocked", "failed", "partial")
+    and nobody knows the hub update needs to be finished by hand.
+
+    'missed' (trigger more than MAX_LATENESS_MINUTES late, so never attempted) must
+    alert as well: the note is simply never written and, without a banner, nothing
+    ever says so. That is the same silent-drop failure class as a blocked write.
+
+    'skipped' does NOT alert — no Notion page / empty summary is a legitimate no-op
+    with nothing for a human to finish."""
+    return outcome in ("blocked", "failed", "partial", "missed")
 
 
 def save_pending(meeting, date_str):
@@ -191,6 +223,19 @@ def save_pending(meeting, date_str):
     log(f"Saved pending note: {fname}")
 
 
+def _notify(head, msg, **kwargs):
+    """Call notify() and log when nothing was actually delivered.
+
+    alert.notify returns False rather than raising when terminal-notifier and
+    osascript both fail, and _fallback_notify always returns False. Every alert here
+    exists because a human has to finish the run by hand, so a swallowed banner means
+    total silence — log it so /tmp/meeting-notes-poller.log still carries the signal."""
+    delivered = notify(head, msg, **kwargs)
+    if not delivered:
+        log(f"NOTIFICATION NOT DELIVERED: {head} — {msg}")
+    return delivered
+
+
 def maybe_notify(outcome, title, date_str, meeting=None):
     if not should_notify(outcome):
         return
@@ -199,17 +244,23 @@ def maybe_notify(outcome, title, date_str, meeting=None):
     if outcome == "blocked":
         head = "Meeting notes: write blocked"
         msg = f"'{title}' ({date_str}): click Apply to open Claude and finish the write"
-        notify(head, msg, execute=APPLY_SCRIPT, action_label="Apply")
+        _notify(head, msg, execute=APPLY_SCRIPT, action_label="Apply")
     elif outcome == "partial":
         # Steps 1-4 succeeded (note written + filed) but Step 5's hub cross-post
         # failed — distinct from a real run failure, so the message says so.
         head = "Meeting notes: hub update failed"
         msg = f"'{title}' ({date_str}): note filed, but the 1:1 hub cross-post failed — finish it manually"
-        notify(head, msg)
+        _notify(head, msg)
+    elif outcome == "missed":
+        # Never attempted: the trigger was already stale when the poller reached it.
+        head = "Meeting notes: meeting missed"
+        msg = (f"'{title}' ({date_str}): trigger was over {MAX_LATENESS_MINUTES}m late, "
+               f"never attempted — process it manually")
+        _notify(head, msg)
     else:
         head = "Meeting notes: run failed"
         msg = f"'{title}' ({date_str}): run failed"
-        notify(head, msg)
+        _notify(head, msg)
 
 
 def log(msg):
@@ -350,11 +401,28 @@ def invoke_claude(prompt, title):
     return rc, output
 
 
+# The tmux session below is a real interactive pty, so EVERY environmental signal the
+# agent can observe says "a user is here" — there is no env var, no --headless flag, no
+# tty check that would reveal otherwise. Headlessness therefore has to be stated in the
+# prompt itself, or CLAUDE.md's "in a headless run, skip instead of asking" branch can
+# never fire: the agent calls AskUserQuestion, blocks on a prompt nobody will ever
+# answer, and the run burns CLAUDE_TIMEOUT_SECONDS before being killed as `failed`.
+HEADLESS_INSTRUCTION = (
+    " IMPORTANT: this is an unattended headless run launched by launchd — there is no "
+    "user present to answer prompts, and any question you ask will simply time out. "
+    "Never call AskUserQuestion (or any other interactive prompt) at any point. Where the "
+    "workflow says to ask Galen — in particular Step 5's ambiguous stakeholder match — "
+    "skip that step instead and print 'RESULT: PARTIAL ambiguous stakeholder match for "
+    "\"<first name>\" (<candidate hub page titles>)' so the runner alerts him to finish "
+    "it by hand."
+)
+
 RESULT_SENTINEL_INSTRUCTION = (
     " When you are completely done, print as the very last line exactly one of: "
     "'RESULT: SUCCESS' if the synthesis was written to the Notion page and the page "
     "was filed/re-parented; 'RESULT: PARTIAL <reason>' if that succeeded but Step 5 "
-    "(the 1:1 hub cross-post) failed; 'RESULT: BLOCKED <reason>' if any Notion write "
+    "(the 1:1 hub cross-post) did not complete — whether it failed or you skipped it "
+    "because it needed a human; 'RESULT: BLOCKED <reason>' if any Notion write "
     "was blocked, denied, or left pending on a permission grant; or "
     "'RESULT: SKIPPED <reason>' if there was no Notion page to write to."
 )
@@ -371,6 +439,7 @@ def notion_only_prompt(title, date_str):
         f"Do not create a page if no Notion page exists or the summary is empty — "
         f"stop and output the SKIPPED sentinel instead. "
         f"Process ONLY this one meeting — do not process other meetings you may find."
+        + HEADLESS_INSTRUCTION
         + RESULT_SENTINEL_INSTRUCTION
     )
 
@@ -427,7 +496,7 @@ def main():
     now = datetime.now().astimezone()
     cutoff = now - timedelta(minutes=MAX_LATENESS_MINUTES)
     changed = False
-    counters = {"fired": 0, "blocked": 0, "skipped": 0, "missed": 0, "failed": 0}
+    counters = {"fired": 0, "blocked": 0, "skipped": 0, "partial": 0, "missed": 0, "failed": 0}
 
     for m in meetings:
         if m.get("status") != "pending":
@@ -445,6 +514,9 @@ def main():
             log(f"Skipping '{title}' — past max lateness ({MAX_LATENESS_MINUTES}m)")
             m["status"] = "missed"
             counters["missed"] += 1
+            # A dropped meeting is never written up at all — alert, or it vanishes
+            # silently into the queue file (see should_notify).
+            maybe_notify("missed", title, meeting_date.isoformat())
             changed = True
             continue
 

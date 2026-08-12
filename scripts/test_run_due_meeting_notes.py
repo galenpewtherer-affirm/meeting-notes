@@ -70,6 +70,25 @@ check("explicit PARTIAL",
       "partial")
 check("notify on partial", r.should_notify("partial"), True)
 
+# Sentinel precedence is incomplete-work-first, not success-first. An LLM final turn
+# routinely narrates the sentinel it is NOT printing; a success-first check matched that
+# stray mention and recorded a fully successful run, which is the silent-drop bug
+# classify_outcome exists to prevent.
+check("PARTIAL wins over narrated SUCCESS",
+      r.classify_outcome(0, "Normally I would print RESULT: SUCCESS here, but the hub "
+                            "cross-post failed, so instead:\nRESULT: PARTIAL hub write failed"),
+      "partial")
+check("BLOCKED wins over narrated SUCCESS",
+      r.classify_outcome(0, "I would have printed RESULT: SUCCESS but the write never "
+                            "landed.\nRESULT: BLOCKED notion write denied"),
+      "blocked")
+check("SKIPPED wins over narrated SUCCESS",
+      r.classify_outcome(0, "This is not a RESULT: SUCCESS run.\nRESULT: SKIPPED no Notion page"),
+      "skipped")
+check("BLOCKED wins over PARTIAL",
+      r.classify_outcome(0, "RESULT: PARTIAL ... RESULT: BLOCKED permission denied"),
+      "blocked")
+
 # --- _as_text(v) ---
 check("_as_text None", r._as_text(None), "")
 check("_as_text str", r._as_text("hi"), "hi")
@@ -86,6 +105,9 @@ check("failed -> failed", r.status_for("failed", False), "failed")
 # --- should_notify(outcome) ---
 check("notify on blocked", r.should_notify("blocked"), True)
 check("notify on failed", r.should_notify("failed"), True)
+# A meeting dropped for lateness is never written up at all — silence there is the same
+# failure class as a silently-blocked write.
+check("notify on missed", r.should_notify("missed"), True)
 check("no notify on success", r.should_notify("success"), False)
 check("no notify on skipped", r.should_notify("skipped"), False)
 
@@ -104,8 +126,47 @@ try:
     r.maybe_notify("failed", "TPM weekly", "2026-06-01")
     check("notify fired on failed", len(_calls), 2)
     check("failed title", _calls[1][0], "Meeting notes: run failed")
+    r.maybe_notify("missed", "Nirmal/Galen 1:1", "2026-06-01")
+    check("notify fired on missed", len(_calls), 3)
+    check("missed title", _calls[2][0], "Meeting notes: meeting missed")
+    check("missed msg names meeting", "Nirmal/Galen 1:1" in _calls[2][1], True)
 finally:
     r.notify = _orig_notify
+
+# --- the no-op fallback stub must accept maybe_notify's blocked-path kwargs ---
+# ALERT_DIR resolves relative to the repo root, so `from alert import notify` DOES fail
+# in some checkouts (any git worktree under .worktrees/, for one) and the stub goes live
+# for real. The stub previously took only (title, message), so maybe_notify's blocked
+# path raised TypeError; that escaped main()'s per-meeting loop and skipped the
+# SCHEDULE_FILE.write_text() after it, silently reverting the whole batch to 'pending'.
+# Exercise the actual fallback object, not a mock that mirrors the real signature.
+_orig_notify = r.notify
+r.notify = r._fallback_notify
+try:
+    for _outcome in ("blocked", "partial", "missed", "failed"):
+        try:
+            # meeting=None so the blocked path skips save_pending's /tmp write.
+            r.maybe_notify(_outcome, "Adam/Galen 1:1", "2026-06-01")
+            check(f"fallback stub survives maybe_notify({_outcome!r})", True, True)
+        except TypeError as e:
+            check(f"fallback stub survives maybe_notify({_outcome!r})", f"TypeError: {e}", True)
+finally:
+    r.notify = _orig_notify
+
+# The stub reports non-delivery so _notify() logs the lost banner rather than treating
+# a swallowed alert as sent.
+check("fallback stub returns False", r._fallback_notify("t", "m", execute="/x", action_label="Apply"), False)
+
+# --- notion_only_prompt must state headlessness in the prompt itself ---
+# CLAUDE.md's "in a headless run, skip instead of asking" branch is unreachable unless the
+# prompt says so: the runner launches claude in a real interactive tmux pty, so every
+# environmental signal the agent can see says a user is present.
+_prompt = r.notion_only_prompt("Adam/Galen 1:1", "2026-06-01")
+check("prompt says headless", "headless" in _prompt.lower(), True)
+check("prompt forbids AskUserQuestion", "AskUserQuestion" in _prompt, True)
+check("prompt gives the PARTIAL escape hatch", "RESULT: PARTIAL" in _prompt, True)
+check("prompt still names the meeting", "Adam/Galen 1:1" in _prompt, True)
+check("prompt still carries the sentinel instruction", "RESULT: SUCCESS" in _prompt, True)
 
 if failures:
     print(f"\n{len(failures)} FAILURE(S)")
