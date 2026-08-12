@@ -166,14 +166,15 @@ def _line_sentinel(line):
     text ("RESULT: SUCCESS - nothing was skipped") cannot flip the verdict. If a malformed
     line crams several sentinels together, resolve incomplete-work-first (blocked >
     partial > ...): over-notifying is recoverable, silently recording an incomplete run
-    as done is not. Otherwise the last one on the line wins, matching the "sentinel goes
-    last" contract."""
+    as done is not. Otherwise the first one on the line wins: the first `RESULT:` mention
+    on a line is the sentinel the agent actually printed, and anything after it on the
+    same line is narration (e.g. "RESULT: SUCCESS (this is not RESULT: SKIPPED)")."""
     line = line.strip().lstrip(_LINE_DECORATION).lower()
     if not line.startswith("result:"):
         return None
     found = []
     for segment in line.split("result:")[1:]:
-        segment = segment.lstrip()
+        segment = segment.lstrip(_LINE_DECORATION)
         for keyword in SENTINELS:
             if segment.startswith(keyword):
                 found.append(keyword)
@@ -184,7 +185,7 @@ def _line_sentinel(line):
         return "blocked"
     if "partial" in found:
         return "partial"
-    return found[-1]
+    return found[0]
 
 
 def classify_outcome(rc, output):
