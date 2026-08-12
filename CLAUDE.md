@@ -235,9 +235,13 @@ never has to do this by hand.
    current list of stakeholder hub sub-pages — do this fresh each time rather than
    hardcoding names/IDs, since stakeholders get added/removed over time.
 3. **Match** the counterpart's first name (case-insensitive) against each listed hub
-   page's title (`<Name> — 1:1s`). If no match, stop — most 1:1s (Adam, Nirmal, Chad,
-   Brian, Parker, Michael, etc.) don't have a dedicated hub page; this is expected and
-   not an error.
+   page's title (`<Name> — 1:1s`). If no match, stop **Step 5 only** — most 1:1s (Adam,
+   Nirmal, Chad, Brian, Parker, Michael, etc.) don't have a dedicated hub page; this is
+   expected and not an error. The run is complete and fully successful, so print
+   `RESULT: SUCCESS` as the final line. Do NOT print `RESULT: SKIPPED` (that sentinel
+   means "there was no Notion page to write to at all", and would make the runner record
+   this successful run as a no-op) and do not exit without a sentinel (the runner then
+   classifies the run `failed` off the missing-sentinel/timeout path).
    - **If more than one hub page matches the same first name** (e.g. "Chris A — 1:1s"
      and "Chris B — 1:1s"), cross-check against the meeting's attendee list — pull the
      attendee names/emails from the Notion AI page's metadata (calendar guest list
@@ -246,10 +250,13 @@ never has to do this by hand.
    - **If still ambiguous after the attendee cross-check** (no attendee data available,
      or it doesn't distinguish the candidates), use `AskUserQuestion` to ask Galen which
      stakeholder this note belongs to. Never guess or silently pick the first match.
-     In a headless run (no interactive user to answer — see Notes on
-     `run_due_meeting_notes.py`), skip the hub update instead of calling
-     `AskUserQuestion`, and report `RESULT: PARTIAL ambiguous stakeholder match for
-     "<first name>" (<hub page titles>)` per item 6 below.
+     **In a headless run, skip the hub update instead of calling `AskUserQuestion`** and
+     report `RESULT: PARTIAL ambiguous stakeholder match for "<first name>" (<hub page
+     titles>)` per item 6 below. You will know the run is headless because
+     `run_due_meeting_notes.py` says so explicitly in its prompt (`HEADLESS_INSTRUCTION`)
+     — do not try to infer it from the environment, since the runner drives a real
+     interactive pty inside tmux and every environmental signal looks interactive.
+     Absent that instruction, treat the run as interactive and ask.
 4. **On a match**, fetch the hub page and condense the Step 3 synthesis (Action
    Items / Quick Recap / Key Discussion Points / Additional Context) into this format:
    ```
@@ -284,11 +291,17 @@ never has to do this by hand.
      lot") exactly where they are — never reorder them relative to the dated headings
      around them.
 6. This step is additive only — it never moves or re-parents the meeting note itself
-   (Step 4b already filed it correctly in the general index). If this step fails, do
-   not undo Steps 1-4 — the meeting note itself is already written and filed. Instead,
-   print `RESULT: PARTIAL <reason>` as the final line instead of `RESULT: SUCCESS`, so
-   the headless runner (`run_due_meeting_notes.py`) alerts Galen to finish the hub
-   update manually rather than silently reporting a clean success.
+   (Step 4b already filed it correctly in the general index). **If this step does not
+   complete** — whether it *failed* (a write error, a `validation_error`, a 503) or you
+   *deliberately skipped it because it could not be completed unattended* (the headless
+   ambiguous-stakeholder branch in item 3) — do not undo Steps 1-4; the meeting note
+   itself is already written and filed. Instead, print `RESULT: PARTIAL <reason>` as the
+   final line instead of `RESULT: SUCCESS`, so the headless runner
+   (`run_due_meeting_notes.py`) alerts Galen to finish the hub update manually rather than
+   silently reporting a clean success.
+   The one case that is **not** `PARTIAL` is item 3's no-hub-page-exists outcome: there is
+   no hub to update and nothing for a human to finish, so that is a plain
+   `RESULT: SUCCESS`.
 
 ---
 
@@ -300,8 +313,20 @@ never has to do this by hand.
 - The runner (`run_due_meeting_notes.py`) triggers this skill headlessly via launchd.
   Print `RESULT: SUCCESS`, `RESULT: PARTIAL <reason>`, `RESULT: BLOCKED <reason>`, or
   `RESULT: SKIPPED <reason>` as the very last line so the runner can classify the
-  outcome. `PARTIAL` covers Steps 1-4 succeeding but Step 5 failing — the runner
-  alerts on it exactly like `BLOCKED`/`FAILED` (see Step 5, item 6).
+  outcome. `PARTIAL` covers Steps 1-4 succeeding while Step 5 did not complete — either
+  it failed, or it was deliberately skipped because it needed a human (see Step 5,
+  item 6). The runner alerts on `PARTIAL` exactly like `BLOCKED`/`FAILED`.
+  **Always print exactly one sentinel, on every path.** The runner has no other way to
+  learn the outcome: an exit with no sentinel is classified `failed`, and a turn
+  containing more than one sentinel is resolved incomplete-work-first
+  (`BLOCKED` > `PARTIAL` > `SKIPPED` > `SUCCESS`), so narrating a sentinel you are not
+  actually printing will mis-classify the run.
+- **A headless run never has a user to answer prompts.** The runner states this in its
+  own prompt (`HEADLESS_INSTRUCTION` in `run_due_meeting_notes.py`) because it launches
+  `claude` in a real interactive pty inside tmux — there is no environmental signal that
+  reveals headlessness, so never try to detect it. When that instruction is present, do
+  not call `AskUserQuestion`: take the documented skip-and-report-`PARTIAL` branch
+  instead. A blocked prompt just burns the runner's 900s timeout and is recorded `failed`.
 - **Never call `notion-create-pages` at any point in this workflow.** Only update
   pages that Notion AI created from a live transcript. If no page exists or the
   summary is empty, skip — there is nothing to synthesize.
