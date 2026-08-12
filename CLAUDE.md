@@ -316,11 +316,14 @@ never has to do this by hand.
   outcome. `PARTIAL` covers Steps 1-4 succeeding while Step 5 did not complete — either
   it failed, or it was deliberately skipped because it needed a human (see Step 5,
   item 6). The runner alerts on `PARTIAL` exactly like `BLOCKED`/`FAILED`.
-  **Always print exactly one sentinel, on every path.** The runner has no other way to
-  learn the outcome: an exit with no sentinel is classified `failed`, and a turn
-  containing more than one sentinel is resolved incomplete-work-first
-  (`BLOCKED` > `PARTIAL` > `SKIPPED` > `SUCCESS`), so narrating a sentinel you are not
-  actually printing will mis-classify the run.
+  **Always print exactly one sentinel, on its own line, as the last line.** The runner
+  has no other way to learn the outcome: an exit with no sentinel is classified `failed`,
+  and the runner reads the **last line that starts with `RESULT:`** — so a sentinel buried
+  mid-sentence is ignored, and a stray `RESULT:` line printed after the real one wins.
+  If a single line somehow carries several sentinels, it resolves incomplete-work-first
+  (`BLOCKED` > `PARTIAL` > last one wins). Narrating a sentinel you are not printing is
+  safe only while it stays mid-sentence; never start a line with a sentinel you do not
+  mean.
 - **A headless run never has a user to answer prompts.** The runner states this in its
   own prompt (`HEADLESS_INSTRUCTION` in `run_due_meeting_notes.py`) because it launches
   `claude` in a real interactive pty inside tmux — there is no environmental signal that

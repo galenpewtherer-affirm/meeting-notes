@@ -145,6 +145,48 @@ def _last_assistant_text(output):
     return text[last_bullet:] if last_bullet != -1 else text
 
 
+# Sentinel keywords the skill may print after `RESULT:` (see CLAUDE.md).
+SENTINELS = ("blocked", "partial", "skipped", "success")
+# Decoration stripped from the head of a line before testing for the `RESULT:` prefix:
+# tmux/Claude Code prefix the final assistant turn with '⏺', indent continuation lines,
+# and the model sometimes bullets or bolds the sentinel line.
+_LINE_DECORATION = " \t*_`#>-⏺•"
+
+
+def _line_sentinel(line):
+    """Return the outcome named by a single line, or None if it is not a sentinel line.
+
+    A line is a sentinel ONLY if its content (after stripping the turn marker /
+    indentation / markdown decoration) starts with `RESULT:`. Prose that merely mentions
+    a sentinel mid-sentence ("this is NOT RESULT: SKIPPED") is not a sentinel line, which
+    is the whole point: the runner must read the sentinel the agent actually printed, not
+    every sentinel word it happened to type.
+
+    Only keywords immediately following a `RESULT:` on the line count, so trailing reason
+    text ("RESULT: SUCCESS - nothing was skipped") cannot flip the verdict. If a malformed
+    line crams several sentinels together, resolve incomplete-work-first (blocked >
+    partial > ...): over-notifying is recoverable, silently recording an incomplete run
+    as done is not. Otherwise the last one on the line wins, matching the "sentinel goes
+    last" contract."""
+    line = line.strip().lstrip(_LINE_DECORATION).lower()
+    if not line.startswith("result:"):
+        return None
+    found = []
+    for segment in line.split("result:")[1:]:
+        segment = segment.lstrip()
+        for keyword in SENTINELS:
+            if segment.startswith(keyword):
+                found.append(keyword)
+                break
+    if not found:
+        return None
+    if "blocked" in found:
+        return "blocked"
+    if "partial" in found:
+        return "partial"
+    return found[-1]
+
+
 def classify_outcome(rc, output):
     """Map (exit code, skill stdout+stderr) to: failed | blocked | skipped | partial | success.
 
@@ -156,25 +198,34 @@ def classify_outcome(rc, output):
     the meeting note itself was written and filed, but the skill's own contract
     was not fully satisfied, so this must still alert (see should_notify).
 
-    Sentinel precedence is deliberately incomplete-work-first (blocked > partial >
-    skipped > success), NOT success-first. An LLM final turn routinely narrates the
-    sentinel it is *not* printing ("normally I'd print RESULT: SUCCESS, but the hub
-    write failed, so: RESULT: PARTIAL ..."), and a success-first check matches that
-    stray mention and silently records a fully successful run — reintroducing exactly
-    the silent-drop bug this function exists to prevent. Biasing toward the
-    alerting outcome can only over-notify, which is recoverable; under-notifying in
-    an unattended launchd run is not."""
+    The sentinel is read from the LAST line of the turn that *starts with* `RESULT:`,
+    per the skill's "print the sentinel as the very last line" contract — NOT by
+    searching the whole turn for sentinel substrings in a fixed precedence order. An LLM
+    final turn routinely narrates the sentinel it is *not* printing, in both directions:
+    "normally I'd print RESULT: SUCCESS, but the hub write failed, so: RESULT: PARTIAL"
+    and (observed on a real Parker 1:1) "this is NOT RESULT: SKIPPED, so: RESULT:
+    SUCCESS". Substring precedence got the first right and the second wrong, recording a
+    written-and-filed note as a skipped no-op that never alerted. Anchoring on the last
+    `RESULT:`-prefixed line handles both, because narration puts the sentinel word
+    mid-sentence while the real sentinel starts its own line.
+
+    When NO line starts with `RESULT:` the turn is off-contract and there is nothing
+    authoritative to anchor on, so fall back to the old whole-text substring scan in
+    incomplete-work-first order (blocked > partial > skipped). That keeps a sentinel the
+    agent buried mid-sentence ("all done. RESULT: BLOCKED ...") alerting instead of
+    defaulting to success, and biasing an already-ambiguous turn toward the alerting
+    outcome can only over-notify, which is recoverable; under-notifying in an unattended
+    launchd run is not."""
     if rc != 0:
         return "failed"
     text = _last_assistant_text(output).lower()
-    if "result: blocked" in text:
-        return "blocked"
-    if "result: partial" in text:
-        return "partial"
-    if "result: skipped" in text:
-        return "skipped"
-    if "result: success" in text:
-        return "success"
+    for line in reversed(text.splitlines()):
+        outcome = _line_sentinel(line)
+        if outcome:
+            return outcome
+    for keyword in ("blocked", "partial", "skipped"):
+        if f"result: {keyword}" in text or f"result:{keyword}" in text:
+            return keyword
     if any(p in text for p in BLOCK_PHRASES):
         return "blocked"
     if any(p in text for p in SKIP_PHRASES):

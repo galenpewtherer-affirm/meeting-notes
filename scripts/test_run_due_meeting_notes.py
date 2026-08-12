@@ -70,10 +70,9 @@ check("explicit PARTIAL",
       "partial")
 check("notify on partial", r.should_notify("partial"), True)
 
-# Sentinel precedence is incomplete-work-first, not success-first. An LLM final turn
-# routinely narrates the sentinel it is NOT printing; a success-first check matched that
-# stray mention and recorded a fully successful run, which is the silent-drop bug
-# classify_outcome exists to prevent.
+# An LLM final turn routinely narrates the sentinel it is NOT printing. The real sentinel
+# is the last line that STARTS with `RESULT:`; a mid-sentence mention is never a sentinel.
+# These four all put the real sentinel last, so the narrated one must lose.
 check("PARTIAL wins over narrated SUCCESS",
       r.classify_outcome(0, "Normally I would print RESULT: SUCCESS here, but the hub "
                             "cross-post failed, so instead:\nRESULT: PARTIAL hub write failed"),
@@ -88,6 +87,62 @@ check("SKIPPED wins over narrated SUCCESS",
 check("BLOCKED wins over PARTIAL",
       r.classify_outcome(0, "RESULT: PARTIAL ... RESULT: BLOCKED permission denied"),
       "blocked")
+
+# Reproduced from a real Parker 1:1 run: Step 5 found no hub page, which CLAUDE.md
+# defines as a plain SUCCESS, and the agent narrated the sentinel it was NOT printing
+# on its own line before printing the real one. Substring-precedence matching saw
+# "skipped" anywhere in the turn and recorded a written-and-filed note as a no-op
+# (skipped does not alert), so the run vanished silently. Only lines that START with
+# `RESULT:` are sentinels; the last such line is the verdict.
+parker_no_hub = (
+    "⏺ No hub page exists for Parker, so per Step 5 item 3 I am stopping Step 5 only.\n"
+    "  Per the instructions this is NOT RESULT: SKIPPED (that would record a no-op), so:\n"
+    "\n"
+    "RESULT: SUCCESS\n"
+)
+check("narrated NOT-SKIPPED then real SUCCESS -> success",
+      r.classify_outcome(0, parker_no_hub), "success")
+
+# Inverse direction: narration mentioning SUCCESS earlier must not beat a real trailing
+# PARTIAL/BLOCKED/SKIPPED sentinel (the case the old precedence order existed to cover).
+check("narrated SUCCESS line then real PARTIAL -> partial",
+      r.classify_outcome(0, "⏺ Steps 1-4 were a full SUCCESS and I nearly printed "
+                            "RESULT: SUCCESS.\nThe hub write 503'd.\n"
+                            "RESULT: PARTIAL hub write failed: 503"),
+      "partial")
+check("narrated SUCCESS line then real SKIPPED -> skipped",
+      r.classify_outcome(0, "⏺ A SUCCESS run would have written the page.\n"
+                            "RESULT: SKIPPED summary block empty"),
+      "skipped")
+
+# The sentinel is still recognized when the assistant-turn marker / list decoration /
+# indentation sits in front of it (tmux prefixes the final turn with '⏺', and the model
+# sometimes bolds or indents the line).
+check("sentinel behind the ⏺ turn marker", r.classify_outcome(0, "⏺ RESULT: SUCCESS"), "success")
+check("sentinel indented + bolded",
+      r.classify_outcome(0, "narration\n  **RESULT: PARTIAL** hub write failed"), "partial")
+
+# A mid-text line that starts with RESULT: is overridden by the later real sentinel.
+check("earlier RESULT: line loses to the last one",
+      r.classify_outcome(0, "RESULT: SKIPPED would be wrong here\nRESULT: SUCCESS"),
+      "success")
+
+# Malformed turn with two sentinels crammed onto one line keeps the incomplete-work-first
+# bias (over-notifying is recoverable; a silent incomplete run is not).
+check("alerting sentinel wins inside one malformed line",
+      r.classify_outcome(0, "RESULT: BLOCKED denied ... not RESULT: SUCCESS"),
+      "blocked")
+
+# Off-contract turn: the agent buried the sentinel mid-sentence so NO line starts with
+# RESULT:. With nothing authoritative to anchor on, fall back to the old whole-text
+# incomplete-work-first scan rather than defaulting to success — a buried BLOCKED/PARTIAL
+# must still alert.
+check("buried BLOCKED sentinel (no line-anchored sentinel) -> blocked",
+      r.classify_outcome(0, "All steps attempted. RESULT: BLOCKED the hub write was denied"),
+      "blocked")
+check("buried PARTIAL sentinel (no line-anchored sentinel) -> partial",
+      r.classify_outcome(0, "Filed the note, then RESULT: PARTIAL because the hub 503'd"),
+      "partial")
 
 # --- _as_text(v) ---
 check("_as_text None", r._as_text(None), "")
