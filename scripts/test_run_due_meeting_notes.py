@@ -10,6 +10,7 @@ mark such runs `fired` (false success). classify_outcome() inspects the skill's
 stdout so blocked/skipped runs are distinguished from real successes.
 """
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -62,6 +63,42 @@ check("no-sentinel + stray grant phrase -> blocked (fail-safe)",
 # Timeout path produces rc=124 -> failed (invoke_claude maps TimeoutExpired to rc 124).
 check("timeout rc 124 -> failed", r.classify_outcome(124, "[runner] TIMEOUT after 900s; process killed."), "failed")
 
+# Early-bail stuck-prompt path produces rc=125 -> stuck, regardless of text
+# (invoke_claude only ever sets rc=125 for this case).
+check("stuck rc 125 -> stuck", r.classify_outcome(125, "[runner] STUCK: stuck at an interactive prompt"), "stuck")
+check("stuck rc 125 beats success marker", r.classify_outcome(125, "RESULT: SUCCESS"), "stuck")
+
+# --- _pane_tail(text, max_lines, max_len) ---
+check("_pane_tail empty", r._pane_tail(""), "")
+check("_pane_tail none", r._pane_tail(None), "")
+check("_pane_tail joins last lines", r._pane_tail("a\n\nb\nc\nd"), "b | c | d")
+check("_pane_tail truncates", len(r._pane_tail("x" * 500, max_len=50)) <= 50, True)
+
+# --- _describe_stuck_prompt(pane_text) ---
+check("trust dialog named specifically",
+      "trust-folder prompt" in r._describe_stuck_prompt("Quick safety check: Is this a project you created or one you trust?\n1. Yes, I trust this folder"),
+      True)
+check("generic stuck prompt falls back to tail",
+      "some other menu" in r._describe_stuck_prompt("some other menu\nEnter to confirm"),
+      True)
+
+# --- _trust_dialog_accepted() ---
+with tempfile.TemporaryDirectory() as td:
+    cfg = Path(td) / "claude.json"
+    orig_cfg, orig_dir = r.CLAUDE_CONFIG, r.MEETING_NOTES_DIR
+    r.CLAUDE_CONFIG, r.MEETING_NOTES_DIR = cfg, "/some/dir"
+    try:
+        cfg.write_text('{"projects": {"/some/dir": {"hasTrustDialogAccepted": false}}}')
+        check("trust false when explicitly false", r._trust_dialog_accepted(), False)
+        cfg.write_text('{"projects": {"/some/dir": {"hasTrustDialogAccepted": true}}}')
+        check("trust true when explicitly true", r._trust_dialog_accepted(), True)
+        cfg.write_text('{"projects": {}}')
+        check("trust true (fail-open) when project missing", r._trust_dialog_accepted(), True)
+        check("trust true (fail-open) when config unreadable",
+              (lambda: (cfg.unlink(), r._trust_dialog_accepted())[-1])(), True)
+    finally:
+        r.CLAUDE_CONFIG, r.MEETING_NOTES_DIR = orig_cfg, orig_dir
+
 # --- _as_text(v) ---
 check("_as_text None", r._as_text(None), "")
 check("_as_text str", r._as_text("hi"), "hi")
@@ -74,30 +111,65 @@ check("blocked -> blocked", r.status_for("blocked", False), "blocked")
 check("blocked no_zoom -> blocked", r.status_for("blocked", True), "blocked")
 check("skipped -> skipped", r.status_for("skipped", False), "skipped")
 check("failed -> failed", r.status_for("failed", False), "failed")
+check("stuck -> stuck", r.status_for("stuck", False), "stuck")
 
 # --- should_notify(outcome) ---
 check("notify on blocked", r.should_notify("blocked"), True)
 check("notify on failed", r.should_notify("failed"), True)
+check("notify on stuck", r.should_notify("stuck"), True)
 check("no notify on success", r.should_notify("success"), False)
 check("no notify on skipped", r.should_notify("skipped"), False)
 
-# --- maybe_notify fires only on blocked/failed, with a useful message ---
+# --- maybe_notify fires only on blocked/failed/stuck, with a useful message
+# and a one-click 'Open' action on every branch ---
 _calls = []
 _orig_notify = r.notify
-r.notify = lambda title, message: _calls.append((title, message))
+r.notify = lambda title, message, **kw: _calls.append((title, message, kw))
 try:
     r.maybe_notify("success", "Adam/Galen 1:1", "2026-06-01")
     r.maybe_notify("skipped", "Greg Office Hours", "2026-06-01")
     check("no notify on success/skipped", len(_calls), 0)
+
     r.maybe_notify("blocked", "Adam/Galen 1:1", "2026-06-01")
     check("notify fired on blocked", len(_calls), 1)
     check("blocked title", _calls[0][0], "Meeting notes: write blocked")
     check("blocked msg names meeting", "Adam/Galen 1:1" in _calls[0][1], True)
-    r.maybe_notify("failed", "TPM weekly", "2026-06-01")
+    check("blocked has Open action", _calls[0][2].get("action_label"), "Open")
+
+    r.maybe_notify("failed", "TPM weekly", "2026-06-01", reason="timed out after 900s while still running")
     check("notify fired on failed", len(_calls), 2)
     check("failed title", _calls[1][0], "Meeting notes: run failed")
+    check("failed msg includes reason", "timed out after 900s" in _calls[1][1], True)
+    check("failed has Open action", _calls[1][2].get("action_label"), "Open")
+
+    r.maybe_notify("failed", "TPM weekly", "2026-06-01")
+    check("failed msg without reason still has a fallback", "run failed" in _calls[2][1], True)
+
+    r.maybe_notify("stuck", "AI Enablement | ProdSec | IT", "2026-08-18",
+                    reason="stuck at Claude Code's first-run trust-folder prompt (nobody there to accept it)")
+    check("notify fired on stuck", len(_calls), 4)
+    check("stuck title", _calls[3][0], "Meeting notes: stuck at a prompt")
+    check("stuck msg includes reason", "trust-folder prompt" in _calls[3][1], True)
+    check("stuck has Open action", _calls[3][2].get("action_label"), "Open")
 finally:
     r.notify = _orig_notify
+
+# --- _maybe_alert_trust_needed: fires once, then respects the cooldown ---
+with tempfile.TemporaryDirectory() as td:
+    marker = Path(td) / "trust-alert-last"
+    orig_marker = r.TRUST_ALERT_MARKER
+    r.TRUST_ALERT_MARKER = marker
+    _trust_calls = []
+    r.notify = lambda title, message, **kw: (_trust_calls.append((title, message, kw)), True)[-1]
+    try:
+        r._maybe_alert_trust_needed()
+        check("trust alert fires first time", len(_trust_calls), 1)
+        check("trust alert has Open action", _trust_calls[0][2].get("action_label"), "Open")
+        r._maybe_alert_trust_needed()
+        check("trust alert suppressed within cooldown", len(_trust_calls), 1)
+    finally:
+        r.notify = _orig_notify
+        r.TRUST_ALERT_MARKER = orig_marker
 
 if failures:
     print(f"\n{len(failures)} FAILURE(S)")

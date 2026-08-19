@@ -23,13 +23,24 @@ Meeting status transitions:
   pending → blocked            (skill ran but a Notion write was blocked/denied on
                                 a permission grant; nothing filed; macOS alert fired)
   pending → skipped            (skill ran but found no Notion page or empty summary)
-  pending → failed             (claude invoked, non-zero exit; macOS alert fired)
+  pending → stuck              (claude never produced an assistant turn and the pane
+                                stopped changing — parked at an interactive prompt
+                                nobody answered; bailed early, macOS alert fired)
+  pending → failed             (claude invoked, non-zero exit some other way — tmux
+                                session died or ran the full CLAUDE_TIMEOUT_SECONDS
+                                still working; macOS alert fired)
+  pending (unchanged)          (meeting-notes dir isn't trusted — see
+                                _trust_dialog_accepted — so this cycle's due meetings
+                                are deferred rather than attempted; retried once trust
+                                is re-accepted)
   pending → missed             (trigger more than MAX_LATENESS_MINUTES late;
                                 never attempted)
 
 NOTE: a 0 exit code no longer implies success — the headless skill exits 0 even
 when blocked on permission, so outcomes are classified from its output (see
-classify_outcome).
+classify_outcome). failed/stuck/blocked alerts all carry a one-click 'Open'
+action (see maybe_notify) and, for failed/stuck, a `reason` string describing
+what the captured pane showed.
 
 Legacy Zoom functions (gmail_service, zoom_asset_exists, reschedule,
 normal_prompt, no_zoom_prompt) are kept below for reference but are not called.
@@ -62,7 +73,20 @@ ZOOM_MAX_ATTEMPTS    = 3
 CLAUDE_TIMEOUT_SECONDS = 900
 # How often to poll the tmux pane for the RESULT: sentinel.
 POLL_INTERVAL_SECONDS = 3
+# Early-bail thresholds for "stuck at an interactive prompt" detection (see
+# invoke_claude): a session that has never printed an assistant turn (no
+# '⏺') and whose pane content has stopped changing is almost always sitting
+# at a prompt with nobody there to answer it (first-run trust dialog, a
+# permission menu the hook didn't catch, etc). No point burning the full
+# CLAUDE_TIMEOUT_SECONDS on that — bail after GRACE + STABLE seconds instead.
+STUCK_PROMPT_GRACE_SECONDS  = 30
+STUCK_PROMPT_STABLE_SECONDS = 15
 GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
+CLAUDE_CONFIG = Path.home() / ".claude.json"
+# Cooldown so a persistently-untrusted directory alerts once per window
+# instead of spamming every poll cycle until Galen fixes it.
+TRUST_ALERT_COOLDOWN_MINUTES = 30
+TRUST_ALERT_MARKER = Path("/tmp/meeting-notes-trust-alert-last")
 
 # macOS notification helper (dependency-free osascript) lives with the peak-events
 # launchd tooling. Import defensively so a missing helper never breaks the runner.
@@ -128,11 +152,14 @@ def _last_assistant_text(output):
 
 
 def classify_outcome(rc, output):
-    """Map (exit code, skill stdout+stderr) to: failed | blocked | skipped | success.
+    """Map (exit code, skill stdout+stderr) to: stuck | failed | blocked | skipped | success.
 
-    rc != 0 is always 'failed'. Otherwise prefer the explicit `RESULT:` sentinel
-    the skill is asked to print, then fall back to known block/skip phrasing.
+    rc == 125 (invoke_claude's early-bail code) is always 'stuck'. Any other
+    rc != 0 is 'failed'. Otherwise prefer the explicit `RESULT:` sentinel the
+    skill is asked to print, then fall back to known block/skip phrasing.
     Defaults to 'success' so a clean run with no markers is still recorded fired."""
+    if rc == 125:
+        return "stuck"
     if rc != 0:
         return "failed"
     text = _last_assistant_text(output).lower()
@@ -158,7 +185,7 @@ def status_for(outcome, no_zoom=False):
 
 def should_notify(outcome):
     """Whether to fire a macOS notification so Galen can finish the run manually."""
-    return outcome in ("blocked", "failed")
+    return outcome in ("blocked", "failed", "stuck")
 
 
 def save_pending(meeting, date_str):
@@ -179,18 +206,35 @@ def save_pending(meeting, date_str):
     log(f"Saved pending note: {fname}")
 
 
-def maybe_notify(outcome, title, date_str, meeting=None):
+def maybe_notify(outcome, title, date_str, meeting=None, reason=None):
+    """Fire a macOS alert for an outcome that needs Galen's attention.
+
+    Every branch gets a one-click 'Open' action (APPLY_SCRIPT: opens Terminal
+    into the meeting-notes dir with an interactive `claude` session already
+    running) — the fix for a blocked write, a stuck prompt, and a generic
+    crash/timeout all start with "open an interactive session and look."
+    failed/stuck messages also carry `reason` (built in invoke_claude from the
+    captured pane, e.g. which prompt it's stuck at, or a tail of the last
+    output) so the notification itself says why, not just that it happened.
+    """
     if not should_notify(outcome):
         return
     if outcome == "blocked" and meeting is not None:
         save_pending(meeting, date_str)
-    head = "Meeting notes: write blocked" if outcome == "blocked" else "Meeting notes: run failed"
+
     if outcome == "blocked":
-        msg = f"'{title}' ({date_str}): click Apply to open Claude and finish the write"
-        notify(head, msg, execute=APPLY_SCRIPT, action_label="Apply")
-    else:
-        msg = f"'{title}' ({date_str}): run failed"
-        notify(head, msg)
+        head = "Meeting notes: write blocked"
+        msg = f"'{title}' ({date_str}): click Open to finish the write"
+    elif outcome == "stuck":
+        head = "Meeting notes: stuck at a prompt"
+        detail = reason or "no assistant activity yet"
+        msg = f"'{title}' ({date_str}): {detail} — click Open to resolve"
+    else:  # failed
+        head = "Meeting notes: run failed"
+        detail = reason or "run failed"
+        msg = f"'{title}' ({date_str}): {detail} — click Open to investigate"
+
+    notify(head, msg, execute=APPLY_SCRIPT, action_label="Open")
 
 
 def log(msg):
@@ -258,6 +302,65 @@ def _has_result_sentinel(pane_text):
     return "result:" in _last_assistant_text(pane_text).lower()
 
 
+def _pane_tail(text, max_lines=3, max_len=160):
+    """Last few non-blank lines of captured pane text, joined and truncated
+    to a length that fits in a macOS notification body."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    tail = " | ".join(lines[-max_lines:])
+    if len(tail) > max_len:
+        tail = tail[: max_len - 1] + "…"
+    return tail
+
+
+def _describe_stuck_prompt(pane_text):
+    """Human-readable reason for an early-bail 'stuck' classification.
+    Names the known first-run trust dialog specifically (the actual cause
+    behind the 2026-08-18 timeouts); falls back to a generic description
+    plus a tail excerpt for anything else that presents the same way."""
+    lower = pane_text.lower()
+    if "trust this folder" in lower or "trust the files in this folder" in lower:
+        return "stuck at Claude Code's first-run trust-folder prompt (nobody there to accept it)"
+    tail = _pane_tail(pane_text)
+    if tail:
+        return f"stuck at an interactive prompt with no activity yet: \"{tail}\""
+    return "stuck at an interactive prompt with no activity yet"
+
+
+def _trust_dialog_accepted():
+    """Best-effort read of Claude Code's per-project trust state for the
+    meeting-notes directory. Returns True if unknown/unreadable — a failed
+    *check* must never itself block a real run, only a confirmed False does."""
+    try:
+        data = json.loads(CLAUDE_CONFIG.read_text())
+        project = data.get("projects", {}).get(MEETING_NOTES_DIR, {})
+        return bool(project.get("hasTrustDialogAccepted", True))
+    except Exception:
+        return True
+
+
+def _maybe_alert_trust_needed():
+    """Cooldown-limited alert for a confirmed-untrusted meeting-notes dir.
+    Checked once per poll cycle (see main) before attempting any due meeting,
+    so a whole cycle's worth of meetings gets one alert instead of one per
+    meeting, and doesn't waste 15 minutes per meeting discovering it the hard
+    way like the 2026-08-18 timeouts did."""
+    now = time.time()
+    if TRUST_ALERT_MARKER.exists():
+        try:
+            last = float(TRUST_ALERT_MARKER.read_text().strip())
+            if now - last < TRUST_ALERT_COOLDOWN_MINUTES * 60:
+                return
+        except Exception:
+            pass
+    notify(
+        "Meeting notes: trust dialog needed",
+        "Claude Code needs the folder-trust prompt re-accepted before any "
+        "meeting can run — click Open to accept it.",
+        execute=APPLY_SCRIPT, action_label="Open",
+    )
+    TRUST_ALERT_MARKER.write_text(str(now))
+
+
 def invoke_claude(prompt, title):
     """Run the skill in a detached tmux session (a real pty) rather than `claude -p`.
 
@@ -287,7 +390,7 @@ def invoke_claude(prompt, title):
     )
     if rc_create != 0:
         log(f"tmux new-session failed for '{title}': {create_out}")
-        return 1, f"[runner] tmux new-session failed: {create_out}"
+        return 1, f"[runner] tmux new-session failed: {create_out}", f"tmux new-session failed: {create_out}"
 
     # Keep the pane alive after claude exits (crash, early error) so the final
     # screen can still be captured instead of vanishing with the session.
@@ -295,13 +398,20 @@ def invoke_claude(prompt, title):
 
     output = ""
     rc = 0
-    deadline = time.time() + CLAUDE_TIMEOUT_SECONDS
+    reason = None
+    start_ts = time.time()
+    seen_assistant_marker = False
+    last_pane = None
+    last_change_ts = None
+    deadline = start_ts + CLAUDE_TIMEOUT_SECONDS
     try:
         while time.time() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
             has_session_rc, _ = _tmux("has-session", "-t", session)
             _, pane = _tmux("capture-pane", "-t", session, "-p", "-S", "-500")
             output = pane
+            if pane.rfind("⏺") != -1:
+                seen_assistant_marker = True
             if _has_result_sentinel(pane):
                 # Debounce: grab one more capture in case trailing UI chrome
                 # (footer redraw) is still settling.
@@ -313,10 +423,37 @@ def invoke_claude(prompt, title):
             if has_session_rc != 0:
                 # Session ended without ever printing a RESULT: sentinel.
                 rc = 1
-                output += "\n[runner] tmux session ended without a RESULT: sentinel."
+                reason = "tmux session ended without printing a RESULT: sentinel"
+                tail = _pane_tail(output)
+                if tail:
+                    reason += f" — last output: \"{tail}\""
+                output += f"\n[runner] {reason}"
                 break
+            if not seen_assistant_marker:
+                # No assistant turn has happened yet. If the pane content has
+                # stopped changing, claude is almost certainly parked at an
+                # interactive prompt (trust dialog, an un-hooked permission
+                # menu, etc) with nobody there to answer it — bail early
+                # instead of waiting out the full timeout to discover that.
+                if pane != last_pane:
+                    last_pane = pane
+                    last_change_ts = time.time()
+                elif (
+                    last_change_ts is not None
+                    and time.time() - start_ts >= STUCK_PROMPT_GRACE_SECONDS
+                    and time.time() - last_change_ts >= STUCK_PROMPT_STABLE_SECONDS
+                ):
+                    rc = 125
+                    reason = _describe_stuck_prompt(pane)
+                    output += f"\n[runner] STUCK: {reason}"
+                    log(f"claude appears stuck at an interactive prompt for '{title}': {reason}")
+                    break
         else:
             rc = 124
+            reason = f"timed out after {CLAUDE_TIMEOUT_SECONDS}s while still running"
+            tail = _pane_tail(output)
+            if tail:
+                reason += f" — last output: \"{tail}\""
             output += f"\n[runner] TIMEOUT after {CLAUDE_TIMEOUT_SECONDS}s; session killed."
             log(f"claude timed out after {CLAUDE_TIMEOUT_SECONDS}s for '{title}'")
     finally:
@@ -328,7 +465,7 @@ def invoke_claude(prompt, title):
         if not output.endswith("\n"):
             runlog.write("\n")
         runlog.flush()
-    return rc, output
+    return rc, output, reason
 
 
 RESULT_SENTINEL_INSTRUCTION = (
@@ -407,7 +544,11 @@ def main():
     now = datetime.now().astimezone()
     cutoff = now - timedelta(minutes=MAX_LATENESS_MINUTES)
     changed = False
-    counters = {"fired": 0, "blocked": 0, "skipped": 0, "missed": 0, "failed": 0}
+    counters = {"fired": 0, "blocked": 0, "skipped": 0, "missed": 0, "failed": 0, "stuck": 0}
+    # Checked lazily (once) on the first due meeting rather than up front, so
+    # a schedule with nothing due yet never pays for a config read.
+    trust_checked = False
+    trusted = True
 
     for m in meetings:
         if m.get("status") != "pending":
@@ -428,12 +569,25 @@ def main():
             changed = True
             continue
 
-        rc, output = invoke_claude(notion_only_prompt(title, meeting_date.isoformat()), title)
+        if not trust_checked:
+            trusted = _trust_dialog_accepted()
+            trust_checked = True
+            if not trusted:
+                log("Meeting-notes directory not trusted; deferring due meetings this cycle and alerting")
+                _maybe_alert_trust_needed()
+
+        if not trusted:
+            # Leave as pending — every due meeting would hit the same wall,
+            # so skip invoking claude for the rest of this cycle and retry
+            # once the trust dialog is re-accepted.
+            continue
+
+        rc, output, reason = invoke_claude(notion_only_prompt(title, meeting_date.isoformat()), title)
         outcome = classify_outcome(rc, output)
         status = status_for(outcome)
         m["status"] = status
         counters[status] = counters.get(status, 0) + 1
-        maybe_notify(outcome, title, meeting_date.isoformat(), m)
+        maybe_notify(outcome, title, meeting_date.isoformat(), m, reason)
         changed = True
 
     if changed:
