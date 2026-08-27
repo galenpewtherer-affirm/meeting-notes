@@ -88,8 +88,9 @@ CLAUDE_CONFIG = Path.home() / ".claude.json"
 TRUST_ALERT_COOLDOWN_MINUTES = 30
 TRUST_ALERT_MARKER = Path("/tmp/meeting-notes-trust-alert-last")
 
-# macOS notification helper (dependency-free osascript) lives with the peak-events
-# launchd tooling. Import defensively so a missing helper never breaks the runner.
+# macOS notification helper (dependency-free osascript) and the durable
+# pending-writes ledger both live with the peak-events launchd tooling.
+# Import defensively so a missing helper never breaks the runner.
 ALERT_DIR = SCRIPTS_DIR.parent.parent / "peak-events" / "scripts"
 sys.path.insert(0, str(ALERT_DIR))
 try:
@@ -97,6 +98,11 @@ try:
 except Exception:
     def notify(title, message):  # no-op fallback
         pass
+try:
+    from pending_writes import record as record_pending
+except Exception:
+    def record_pending(*a, **k):  # no-op fallback
+        return None
 
 # Phrases indicating the skill could NOT complete the Notion write. The headless
 # skill exits 0 even when a write is blocked pending a permission grant, so exit
@@ -188,8 +194,14 @@ def should_notify(outcome):
     return outcome in ("blocked", "failed", "stuck")
 
 
-def save_pending(meeting, date_str):
-    """Save blocked meeting metadata to PENDING_DIR for interactive retry."""
+def save_pending(meeting, date_str, output=None):
+    """Save blocked meeting metadata to PENDING_DIR for interactive retry, and
+    mirror it into the durable pending_writes ledger (data/pending_writes/ in
+    peak-events, not /tmp) so an unresolved block re-surfaces every day via
+    check_pending_writes.py instead of relying solely on the one-shot alert
+    below. The source (Notion AI's own summary block) persists independently
+    and can be re-synthesized on retry, so this is a visibility safety net,
+    not the only copy of any content."""
     PENDING_DIR.mkdir(exist_ok=True)
     title = meeting.get("title", "Untitled")
     safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in title).strip()[:50]
@@ -204,9 +216,16 @@ def save_pending(meeting, date_str):
     }
     (PENDING_DIR / fname).write_text(json.dumps(payload, indent=2))
     log(f"Saved pending note: {fname}")
+    entry_id = record_pending(
+        job="meeting-notes-runner",
+        description=f"'{title}' ({date_str}): Notion write blocked - rerun via {APPLY_SCRIPT}",
+        content=output,
+    )
+    if entry_id:
+        log(f"Recorded pending-write entry {entry_id}")
 
 
-def maybe_notify(outcome, title, date_str, meeting=None, reason=None):
+def maybe_notify(outcome, title, date_str, meeting=None, reason=None, output=None):
     """Fire a macOS alert for an outcome that needs Galen's attention.
 
     Every branch gets a one-click 'Open' action (APPLY_SCRIPT: opens Terminal
@@ -220,7 +239,7 @@ def maybe_notify(outcome, title, date_str, meeting=None, reason=None):
     if not should_notify(outcome):
         return
     if outcome == "blocked" and meeting is not None:
-        save_pending(meeting, date_str)
+        save_pending(meeting, date_str, output)
 
     if outcome == "blocked":
         head = "Meeting notes: write blocked"
@@ -395,6 +414,13 @@ def invoke_claude(prompt, title):
     # Keep the pane alive after claude exits (crash, early error) so the final
     # screen can still be captured instead of vanishing with the session.
     _tmux("set-option", "-t", session, "remain-on-exit", "on")
+    # Explicit history-limit, not just tmux's default (2000 lines unless
+    # configured otherwise) — a long-running synthesis with a lot of tool-call
+    # chatter can scroll the actual synthesized content out of a too-small
+    # scrollback before the RESULT sentinel appears, silently truncating what
+    # gets captured/persisted (pending_writes.record() via save_pending(),
+    # RUN_LOG, etc). Same fix applied to the sibling claude_tmux.py helper.
+    _tmux("set-option", "-t", session, "history-limit", "10000")
 
     output = ""
     rc = 0
@@ -408,7 +434,7 @@ def invoke_claude(prompt, title):
         while time.time() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
             has_session_rc, _ = _tmux("has-session", "-t", session)
-            _, pane = _tmux("capture-pane", "-t", session, "-p", "-S", "-500")
+            _, pane = _tmux("capture-pane", "-t", session, "-p", "-S", "-5000")
             output = pane
             if pane.rfind("⏺") != -1:
                 seen_assistant_marker = True
@@ -416,7 +442,7 @@ def invoke_claude(prompt, title):
                 # Debounce: grab one more capture in case trailing UI chrome
                 # (footer redraw) is still settling.
                 time.sleep(1.5)
-                _, pane2 = _tmux("capture-pane", "-t", session, "-p", "-S", "-500")
+                _, pane2 = _tmux("capture-pane", "-t", session, "-p", "-S", "-5000")
                 output = pane2
                 rc = 0
                 break
@@ -587,7 +613,7 @@ def main():
         status = status_for(outcome)
         m["status"] = status
         counters[status] = counters.get(status, 0) + 1
-        maybe_notify(outcome, title, meeting_date.isoformat(), m, reason)
+        maybe_notify(outcome, title, meeting_date.isoformat(), m, reason, output)
         changed = True
 
     if changed:

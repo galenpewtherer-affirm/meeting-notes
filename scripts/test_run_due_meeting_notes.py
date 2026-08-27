@@ -171,6 +171,39 @@ with tempfile.TemporaryDirectory() as td:
         r.notify = _orig_notify
         r.TRUST_ALERT_MARKER = orig_marker
 
+# --- save_pending: mirrors blocked meetings into the durable pending_writes ledger ---
+with tempfile.TemporaryDirectory() as td:
+    orig_pending_dir = r.PENDING_DIR
+    orig_record = r.record_pending
+    r.PENDING_DIR = Path(td)
+    _recorded = []
+    r.record_pending = lambda **kw: (_recorded.append(kw), "fake-entry-id")[-1]
+    try:
+        r.save_pending({"title": "Peak Event planning"}, "2026-08-27", output="pane text")
+        check("save_pending calls record_pending once", len(_recorded), 1)
+        check("record_pending job is meeting-notes-runner", _recorded[0]["job"], "meeting-notes-runner")
+        check("record_pending description names the meeting", "Peak Event planning" in _recorded[0]["description"], True)
+        check("record_pending content is the pane output", _recorded[0]["content"], "pane text")
+    finally:
+        r.PENDING_DIR = orig_pending_dir
+        r.record_pending = orig_record
+
+# --- save_pending: a missing/broken pending_writes import must never crash the runner ---
+with tempfile.TemporaryDirectory() as td:
+    orig_pending_dir = r.PENDING_DIR
+    orig_record = r.record_pending
+    r.PENDING_DIR = Path(td)
+    r.record_pending = lambda **kw: None  # mirrors the defensive no-op fallback import
+    try:
+        try:
+            r.save_pending({"title": "Peak Event planning"}, "2026-08-27", output="pane text")
+            check("save_pending tolerates a no-op record_pending", True, True)
+        except Exception as e:
+            check("save_pending tolerates a no-op record_pending", f"raised {e!r}", True)
+    finally:
+        r.PENDING_DIR = orig_pending_dir
+        r.record_pending = orig_record
+
 if failures:
     print(f"\n{len(failures)} FAILURE(S)")
     sys.exit(1)
