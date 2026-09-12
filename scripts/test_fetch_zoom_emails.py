@@ -13,7 +13,6 @@ successful write + file.
 import io
 import json
 import sys
-import types
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -68,9 +67,7 @@ out = run_main(["--mark", "aaa"])
 check("--mark of existing id adds 0", json.loads(out)["added"] == 0)
 
 # --- C1c: fetching does NOT mark (the core regression) ---------------------
-# Stub out auth + the Gmail client so main() runs offline and returns one msg.
-f.get_creds = lambda: object()
-
+# Stub out the gws-backed Gmail wrappers so main() runs offline and returns one msg.
 fake_msg = {
     "payload": {
         "headers": [
@@ -81,30 +78,8 @@ fake_msg = {
         "body": {"data": ""},
     }
 }
-
-
-class _Messages:
-    def list(self, userId, q, maxResults):
-        return types.SimpleNamespace(execute=lambda: {"messages": [{"id": "newid123"}]})
-
-    def get(self, userId, id, format):
-        return types.SimpleNamespace(execute=lambda: fake_msg)
-
-
-class _Users:
-    def messages(self):
-        return _Messages()
-
-
-class _Service:
-    def users(self):
-        return _Users()
-
-
-fake_discovery = types.ModuleType("googleapiclient.discovery")
-fake_discovery.build = lambda *a, **k: _Service()
-sys.modules["googleapiclient"] = types.ModuleType("googleapiclient")
-sys.modules["googleapiclient.discovery"] = fake_discovery
+f.gmail_messages_list = lambda q, max_results: {"messages": [{"id": "newid123"}]}
+f.gmail_messages_get = lambda msg_id, format: fake_msg
 
 with_temp_processed([])
 out = run_main(["--since", "2026-06-01"])

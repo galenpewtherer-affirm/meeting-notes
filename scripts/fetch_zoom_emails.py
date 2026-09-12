@@ -42,20 +42,9 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-TOKEN_FILE     = os.path.join(os.path.dirname(__file__), "gmail_token.json")
+from gws_google_client import gmail_messages_list, gmail_messages_get
+
 PROCESSED_FILE = os.path.join(os.path.dirname(__file__), "processed_ids.json")
-SCOPES         = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-
-def get_creds():
-    import google.oauth2.credentials
-    from google.auth.transport.requests import Request
-    with open(TOKEN_FILE) as f:
-        info = json.load(f)
-    creds = google.oauth2.credentials.Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds
 
 
 def load_processed():
@@ -173,18 +162,8 @@ def main():
     since = args.since or (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     since_ts = datetime.strptime(since, "%Y-%m-%d").strftime("%Y/%m/%d")
 
-    try:
-        from googleapiclient.discovery import build
-    except ImportError:
-        sys.exit("Error: google-api-python-client not installed.\nRun: pip install google-api-python-client")
-
-    creds   = get_creds()
-    service = build("gmail", "v1", credentials=creds)
-
     query   = f'from:no-reply@zoom.us subject:"Meeting assets for" after:{since_ts}'
-    results = service.users().messages().list(
-        userId="me", q=query, maxResults=args.limit
-    ).execute()
+    results = gmail_messages_list(q=query, max_results=args.limit)
 
     messages  = results.get("messages", [])
     processed = load_processed() if not args.fetch_all else set()
@@ -195,7 +174,7 @@ def main():
         if msg_id in processed:
             continue
 
-        msg     = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+        msg     = gmail_messages_get(msg_id, format="full")
         headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
 
         subject       = headers.get("Subject", "")

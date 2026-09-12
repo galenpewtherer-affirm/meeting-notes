@@ -42,8 +42,8 @@ classify_outcome). failed/stuck/blocked alerts all carry a one-click 'Open'
 action (see maybe_notify) and, for failed/stuck, a `reason` string describing
 what the captured pane showed.
 
-Legacy Zoom functions (gmail_service, zoom_asset_exists, reschedule,
-normal_prompt, no_zoom_prompt) are kept below for reference but are not called.
+Legacy Zoom functions (zoom_asset_exists, reschedule, normal_prompt, no_zoom_prompt)
+are kept below for reference but are not called.
 """
 import json
 import os
@@ -54,9 +54,10 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from gws_google_client import gmail_messages_list
+
 SCRIPTS_DIR   = Path(__file__).parent
 SCHEDULE_FILE = Path.home() / ".meeting-notes-schedule.json"
-GMAIL_TOKEN   = SCRIPTS_DIR / "gmail_token.json"
 LOG_PREFIX    = "[run_due_meeting_notes]"
 CLAUDE        = "/Users/galen.pewtherer/.local/bin/claude"
 TMUX          = "/opt/homebrew/bin/tmux"
@@ -81,7 +82,6 @@ POLL_INTERVAL_SECONDS = 3
 # CLAUDE_TIMEOUT_SECONDS on that — bail after GRACE + STABLE seconds instead.
 STUCK_PROMPT_GRACE_SECONDS  = 30
 STUCK_PROMPT_STABLE_SECONDS = 15
-GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
 CLAUDE_CONFIG = Path.home() / ".claude.json"
 # Cooldown so a persistently-untrusted directory alerts once per window
 # instead of spamming every poll cycle until Galen fixes it.
@@ -264,24 +264,14 @@ def parse_dt(dt_str):
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
 
-def gmail_service():
-    import google.oauth2.credentials
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
-
-    with open(GMAIL_TOKEN) as f:
-        info = json.load(f)
-    creds = google.oauth2.credentials.Credentials.from_authorized_user_info(info, GMAIL_SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(GMAIL_TOKEN, "w") as f:
-            f.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds)
-
-
-def zoom_asset_exists(service, meeting_title, meeting_date):
+def zoom_asset_exists(meeting_title, meeting_date):
     """Read-only Gmail check: is there a 'Meeting assets for <title>' email from
-    no-reply@zoom.us dated on or after meeting_date? Returns bool."""
+    no-reply@zoom.us dated on or after meeting_date? Returns bool.
+
+    Auth: gws_google_client.py (the `gws` CLI) -- migrated 2026-09-12 off the personal
+    gmail_token.json OAuth token (see ~/.claude/plans/shiny-shimmying-popcorn.md). This
+    function is legacy/unused (see module docstring) but kept working rather than left
+    pointing at a token whose backing GCP project is being decommissioned."""
     quoted_title = meeting_title.replace('"', '\\"')
     after = meeting_date.strftime("%Y/%m/%d")
     query = (
@@ -290,9 +280,7 @@ def zoom_asset_exists(service, meeting_title, meeting_date):
         f'after:{after}'
     )
     try:
-        result = service.users().messages().list(
-            userId="me", q=query, maxResults=1
-        ).execute()
+        result = gmail_messages_list(q=query, max_results=1)
         return bool(result.get("messages"))
     except Exception as e:
         log(f"Gmail check failed for '{meeting_title}': {e}")

@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""Quick script to inspect the structure of a recent Zoom recording email."""
+"""Quick script to inspect the structure of a recent Zoom recording email.
 
-import os, sys, json, base64
-from pathlib import Path
+Auth: gws_google_client.py (the `gws` CLI) -- migrated 2026-09-12 off the personal
+gmail_token.json OAuth token, whose backing GCP project ("Peak Events") is being
+decommissioned 2026-09-30. See ~/.claude/plans/shiny-shimmying-popcorn.md.
+"""
 
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "gmail_token.json")
-SCOPES     = ["https://www.googleapis.com/auth/gmail.readonly"]
+import base64
 
-
-def get_creds():
-    import google.oauth2.credentials
-    from google.auth.transport.requests import Request
-    with open(TOKEN_FILE) as f:
-        info = json.load(f)
-    creds = google.oauth2.credentials.Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds
+from gws_google_client import gmail_messages_list, gmail_messages_get
 
 
 def decode_body(data):
@@ -40,16 +32,8 @@ def walk_parts(parts, depth=0):
 
 
 def main():
-    from googleapiclient.discovery import build
-    creds   = get_creds()
-    service = build("gmail", "v1", credentials=creds)
-
     # Search for Zoom recording emails
-    results = service.users().messages().list(
-        userId="me",
-        q='from:no-reply@zoom.us subject:"Cloud Recording"',
-        maxResults=1
-    ).execute()
+    results = gmail_messages_list(q='from:no-reply@zoom.us subject:"Cloud Recording"', max_results=1)
 
     messages = results.get("messages", [])
     if not messages:
@@ -57,7 +41,7 @@ def main():
         return
 
     msg_id = messages[0]["id"]
-    msg    = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    msg    = gmail_messages_get(msg_id, format="full")
 
     headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
     print(f"Subject: {headers.get('Subject')}")
