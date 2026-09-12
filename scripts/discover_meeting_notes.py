@@ -56,45 +56,83 @@ def log(msg):
 
 
 def discovery_prompt():
+    # Filter shape verified live 2026-09-12 against the real notion-query-meeting-notes
+    # tool (two earlier hand-guessed shapes were rejected by its schema before this
+    # one worked -- built with json.dumps here, not hand-written, to avoid a repeat).
+    filter_json = json.dumps({
+        "operator": "and",
+        "filters": [{
+            "property": "created_time",
+            "filter": {
+                "operator": "date_is_within",
+                "value": {
+                    "type": "relative",
+                    "value": "custom",
+                    "direction": "past",
+                    "unit": "day",
+                    "count": DISCOVERY_LOOKBACK_DAYS,
+                },
+            },
+        }],
+    })
     return (
         "You are ONLY discovering candidate meetings for later processing by a "
         "separate step -- do NOT write to Notion, do NOT run the meeting-notes "
         "synthesis workflow, do NOT use the Skill tool. "
-        f"Call notion-query-meeting-notes filtering created_time with operator "
-        f"date_is_within, value {{\"type\": \"relative\", \"value\": {{\"type\": "
-        f"\"relative\", \"direction\": \"past\", \"unit\": \"day\", \"count\": "
-        f"{DISCOVERY_LOOKBACK_DAYS}, \"value\": \"custom\"}}}}. "
-        "For EVERY row returned, fetch it (notion-fetch) and judge its <summary> "
-        "block using the exact rule from this directory's CLAUDE.md Step 1: it is "
-        "EMPTY only if <summary> is missing/whitespace, or is Notion's no-content "
-        "boilerplate ('It looks like your transcript and notes are empty this time "
-        "around' / 'could not be generated due to insufficient transcript'), or has "
-        "no headings and no Action Items anywhere in it -- otherwise it is "
-        "populated (ready). "
+        f"Call notion-query-meeting-notes with this exact filter argument: {filter_json} "
+        "Each result row has fields \"Title\", \"Created time\" (ISO8601 UTC), and "
+        "\"url\" -- url is the only real per-row identifier, use it as-is. "
+        "For EVERY row returned, fetch it (notion-fetch) and judge its content using "
+        "the exact rule from this directory's CLAUDE.md Step 1 (judge the <summary> "
+        "block, never the raw transcript/<notes> block): a row is EMPTY/not ready "
+        "only if there is no real synthesized or transcript-derived content yet -- "
+        "missing/whitespace, or Notion's no-content boilerplate ('It looks like your "
+        "transcript and notes are empty this time around' / 'could not be generated "
+        "due to insufficient transcript'), or literally nothing but a 'Filing target: "
+        "...' stub with no other content. A page that already has real content of any "
+        "kind (a synthesized ## Action Items structure from an earlier run, a raw "
+        "transcript, or a Notion AI summary) is ready=true -- being already-synthesized "
+        "does not make it not-ready, that distinction is handled by a separate step, "
+        "not by you. "
         "Then, as the very last lines of your final turn, print EXACTLY one line "
         f"starting with '{CANDIDATES_MARKER} ' followed by a single-line compact "
         "JSON array (no pretty-printing, no other text on that line), one object "
-        "per row: {\"id\": <page id or url>, \"title\": <base title with the "
-        "'@<Date> <Time>' suffix stripped>, \"created_time\": <ISO8601 string>, "
-        "\"ready\": true or false}. If there are zero rows, print "
+        "per row: {\"id\": <the row's url field, verbatim>, \"title\": <the row's "
+        "Title field, with any trailing '@<Date> <Time>' suffix stripped if present, "
+        "otherwise used as-is>, \"created_time\": <the row's Created time field, "
+        "verbatim>, \"ready\": true or false}. If there are zero rows, print "
         f"'{CANDIDATES_MARKER} []'. "
         "Then print exactly one of: 'RESULT: SUCCESS' or 'RESULT: FAILED <reason>'."
     )
 
 
 def extract_candidates(output):
-    """Returns the parsed candidates list, or None if the marker line is
+    """Returns the parsed candidates list, or None if the marker is
     missing/unparseable (caller must treat None as "discovery failed, don't
-    touch the schedule file" -- never as "zero candidates")."""
-    marker_line = None
-    for line in output.splitlines():
-        if CANDIDATES_MARKER in line:
-            marker_line = line  # last occurrence wins (post-assistant-turn text)
-    if marker_line is None:
+    touch the schedule file" -- never as "zero candidates").
+
+    Confirmed live 2026-09-12: tmux's captured pane hard-wraps long lines at
+    the pty width (220 cols), splitting the JSON mid-string at a word boundary
+    (e.g. "...\"title\":\"Zoom\\n  Meeting\",...") -- a naive single-line
+    split/json.loads chokes on the fragment. Collapsing all whitespace
+    (including the wrap-introduced newlines and tmux's re-indented
+    continuation-line lead-in spaces) back to single spaces before parsing
+    reconstructs the original line, since Claude Code's TUI wraps at word
+    boundaries, never mid-token.
+    """
+    idx = output.rfind(CANDIDATES_MARKER)
+    if idx == -1:
         return None
-    raw = marker_line.split(CANDIDATES_MARKER, 1)[1].strip()
+    tail = output[idx + len(CANDIDATES_MARKER):]
+    result_idx = tail.find("RESULT:")
+    if result_idx != -1:
+        tail = tail[:result_idx]
+    collapsed = " ".join(tail.split())
+    start, end = collapsed.find("["), collapsed.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
     try:
-        candidates = json.loads(raw)
+        candidates = json.loads(collapsed[start:end + 1])
     except json.JSONDecodeError:
         return None
     if not isinstance(candidates, list):

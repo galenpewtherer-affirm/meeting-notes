@@ -138,6 +138,24 @@ check("extract_candidates uses the LAST marker line (post-assistant-turn text)",
           f'{d.CANDIDATES_MARKER} [{{"id": "real", "title": "T", "created_time": "x", "ready": true}}]\n'
       )[0]["id"] == "real")
 
+# --- real regression: tmux hard-wraps long lines mid-string at the pty width ---
+# Captured verbatim from a live run 2026-09-12 (220-col pty) -- the title value
+# "Zoom Meeting" got split across the wrap with re-indented continuation spaces.
+wrapped_real_output = (
+    '⏺ CANDIDATES_JSON: [{"id":"https://app.notion.com/p/6038a3a3c4ff45379c0a22e8094adbc4","title":"Zoom\n'
+    '  Meeting","created_time":"2026-09-12T11:27:56.557Z","ready":false},{"id":"https://app.notion.com/p/3d840e54ae3881a697ead5c8cf428d88","title":"BFCM peak readiness prep - potential\n'
+    '  centralization","created_time":"2026-09-11T17:01:51.089Z","ready":true}]\n'
+    '  RESULT: SUCCESS\n'
+)
+result = d.extract_candidates(wrapped_real_output)
+check("extract_candidates survives a real tmux word-wrap mid-JSON", result is not None and len(result) == 2)
+if result:
+    check("wrapped title reconstructed correctly", result[0]["title"] == "Zoom Meeting")
+    check("second wrapped title reconstructed correctly",
+          result[1]["title"] == "BFCM peak readiness prep - potential centralization")
+    check("wrapped ready flags parsed correctly",
+          result[0]["ready"] is False and result[1]["ready"] is True)
+
 
 if failures:
     print(f"\n{len(failures)} FAILED: {failures}")
